@@ -152,7 +152,13 @@ async function deployToNetlify(dir, projectId, logs) {
   }
 }
 
-async function deployContracts(dir, projectId, logs) {
+async function deployContracts(dir, projectId, logs, skipContracts = false) {
+  // Check skipContracts flag FIRST
+  if (skipContracts) {
+    console.log(`[${projectId}] skipContracts flag is true, skipping contract deployment`);
+    return null;
+  }
+
   if (!ENABLE_CONTRACT_DEPLOYMENT || !PRIVATE_KEY) {
     console.log(`[${projectId}] Contract deployment disabled or no private key provided`);
     return null;
@@ -568,11 +574,14 @@ app.post("/deploy", requireAuth, async (req, res) => {
   const files = req.body.files;
   const wait = req.body.wait ?? true; // default: wait for readiness
   const deployToExternal = req.body.deployToExternal; // platform: "vercel" | "netlify" | undefined
-  
+  const isWeb3 = req.body.isWeb3;
+  const skipContracts = req.body.skipContracts ?? false; // default: false (deploy contracts if they exist)
+
   if (!projectId) return res.status(400).json({ error: "hash required" });
   if (!files) return res.status(400).json({ error: "files required" });
 
   console.log(`[${projectId}] Starting deploy process... (Environment: ${IS_RAILWAY ? 'Railway' : 'Local'})`);
+  console.log(`[${projectId}] Deploy flags: isWeb3=${isWeb3}, skipContracts=${skipContracts}`);
   
   try {
     // Convert files object to array format
@@ -590,11 +599,11 @@ app.post("/deploy", requireAuth, async (req, res) => {
     const shouldDeployExternal = effectiveDeployToExternal && 
       (effectiveDeployToExternal === "vercel" || effectiveDeployToExternal === "netlify");
     
-    if (shouldDeployExternal && 
+    if (shouldDeployExternal &&
         ((effectiveDeployToExternal === "vercel" && ENABLE_VERCEL_DEPLOYMENT) ||
          (effectiveDeployToExternal === "netlify" && ENABLE_NETLIFY_DEPLOYMENT))) {
       console.log(`[${projectId}] External deployment requested to ${effectiveDeployToExternal}`);
-      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, res, deployStartTime);
+      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime);
     }
 
     // Railway-specific: Return error if external deployment not available
@@ -606,7 +615,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
     }
 
     // Default: Local deployment flow (only for local environment)
-    return await handleLocalDeployment(projectId, filesArray, wait, res, deployStartTime);
+    return await handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime);
     
   } catch (e) {
     console.error(`[${projectId}] Deploy failed after ${Date.now() - deployStartTime}ms:`, e);
@@ -615,12 +624,12 @@ app.post("/deploy", requireAuth, async (req, res) => {
 });
 
 // Handle external deployment logic
-async function handleExternalDeployment(projectId, filesArray, platform, res, deployStartTime) {
+async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime) {
   try {
     console.log(`[${projectId}] Starting external deployment to ${platform}...`);
-    
+
     const dir = path.join(PREVIEWS_ROOT, `${projectId}-${platform}`);
-    
+
     // Clean existing directory
     if (existsSync(dir)) {
       console.log(`[${projectId}] Cleaning existing deployment directory...`);
@@ -630,7 +639,7 @@ async function handleExternalDeployment(projectId, filesArray, platform, res, de
     // Copy boilerplate and write files
     await copyBoilerplate(dir);
     await writeFiles(dir, filesArray);
-    
+
     // Remove pnpm-lock.yaml to force npm usage
     const pnpmLockPath = path.join(dir, 'pnpm-lock.yaml');
     if (existsSync(pnpmLockPath)) {
@@ -645,7 +654,7 @@ async function handleExternalDeployment(projectId, filesArray, platform, res, de
     // Deploy contracts to testnet if enabled
     let contractDeploymentInfo = null;
     try {
-      contractDeploymentInfo = await deployContracts(dir, projectId, logs);
+      contractDeploymentInfo = await deployContracts(dir, projectId, logs, skipContracts);
       if (contractDeploymentInfo) {
         console.log(`[${projectId}] 📄 Contract deployment info saved`);
       }
@@ -678,12 +687,12 @@ async function handleExternalDeployment(projectId, filesArray, platform, res, de
       }
       
       console.log(`[${projectId}] Falling back to local deployment`);
-      return handleLocalDeployment(projectId, filesArray, true, res, deployStartTime);
+      return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime);
     }
 
     if (!platformEnabled) {
       console.log(`[${projectId}] ${platform} deployment disabled or not configured, falling back to local`);
-      return handleLocalDeployment(projectId, filesArray, true, res, deployStartTime);
+      return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime);
     }
 
     // Register external deployment in previews map for updates
@@ -725,8 +734,8 @@ async function handleExternalDeployment(projectId, filesArray, platform, res, de
   }
 }
 
-// Handle local deployment logic  
-async function handleLocalDeployment(projectId, filesArray, wait, res, deployStartTime) {
+// Handle local deployment logic
+async function handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime) {
   try {
     // If running, patch files and return
     if (previews.has(projectId)) {
@@ -764,7 +773,7 @@ async function handleLocalDeployment(projectId, filesArray, wait, res, deploySta
     // Deploy contracts to testnet if enabled
     let contractDeploymentInfo = null;
     try {
-      contractDeploymentInfo = await deployContracts(dir, projectId, logs);
+      contractDeploymentInfo = await deployContracts(dir, projectId, logs, skipContracts);
       if (contractDeploymentInfo) {
         console.log(`[${projectId}] 📄 Contract deployment info saved`);
       }
