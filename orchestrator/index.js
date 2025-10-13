@@ -567,6 +567,133 @@ app.post("/validate", requireAuth, async (req, res) => {
   }
 });
 
+// Contract deployment endpoint - deploys contracts BEFORE app deployment
+app.post("/deploy-contracts", requireAuth, async (req, res) => {
+  const deployStartTime = Date.now();
+  const { projectId, files } = req.body;
+
+  if (!projectId) {
+    return res.status(400).json({
+      success: false,
+      error: "projectId required"
+    });
+  }
+
+  if (!files || !Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "files array required"
+    });
+  }
+
+  console.log(`[${projectId}] 🔗 Contract deployment requested...`);
+  console.log(`[${projectId}] Environment: ${IS_RAILWAY ? 'Railway' : 'Local'}`);
+
+  try {
+    // Check if contract deployment is enabled
+    if (!ENABLE_CONTRACT_DEPLOYMENT) {
+      return res.status(400).json({
+        success: false,
+        error: "Contract deployment is not enabled. Set ENABLE_CONTRACT_DEPLOYMENT=true"
+      });
+    }
+
+    if (!PRIVATE_KEY) {
+      return res.status(400).json({
+        success: false,
+        error: "Contract deployment requires PRIVATE_KEY environment variable"
+      });
+    }
+
+    // Create temporary directory for contract deployment
+    const tempDir = path.join(PREVIEWS_ROOT, `${projectId}-contracts-temp`);
+    console.log(`[${projectId}] Creating temporary directory: ${tempDir}`);
+
+    // Clean up if exists
+    if (existsSync(tempDir)) {
+      console.log(`[${projectId}] Cleaning existing temp directory...`);
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+
+    // Copy boilerplate
+    console.log(`[${projectId}] Setting up contract deployment environment...`);
+    await copyBoilerplate(tempDir);
+
+    // Filter and write only contract-related files
+    const contractFiles = files.filter(f =>
+      f.path.startsWith('contracts/') ||
+      f.path.includes('hardhat.config') ||
+      f.path.startsWith('scripts/') ||
+      f.path === 'package.json'
+    );
+
+    if (contractFiles.length === 0) {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      return res.status(400).json({
+        success: false,
+        error: "No contract files found in project"
+      });
+    }
+
+    console.log(`[${projectId}] Writing ${contractFiles.length} contract files...`);
+    await writeFiles(tempDir, contractFiles);
+
+    // Deploy contracts using existing function
+    const logs = makeRing();
+    console.log(`[${projectId}] Starting contract compilation and deployment...`);
+
+    const contractDeploymentInfo = await deployContracts(
+      tempDir,
+      projectId,
+      logs,
+      false // don't skip contracts
+    );
+
+    // Clean up temp directory
+    console.log(`[${projectId}] Cleaning up temporary directory...`);
+    await fs.rm(tempDir, { recursive: true, force: true });
+
+    if (!contractDeploymentInfo) {
+      return res.status(500).json({
+        success: false,
+        error: "Contract deployment returned no deployment info"
+      });
+    }
+
+    const deploymentTime = Date.now() - deployStartTime;
+    console.log(`[${projectId}] ✅ Contracts deployed successfully in ${deploymentTime}ms`);
+    console.log(`[${projectId}] Contract addresses:`, JSON.stringify(contractDeploymentInfo, null, 2));
+
+    return res.json({
+      success: true,
+      contractAddresses: contractDeploymentInfo,
+      network: 'baseSepolia',
+      rpcUrl: BASE_SEPOLIA_RPC_URL,
+      deploymentTime,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error(`[${projectId}] ❌ Contract deployment failed after ${Date.now() - deployStartTime}ms:`, error);
+
+    // Clean up temp directory on error
+    const tempDir = path.join(PREVIEWS_ROOT, `${projectId}-contracts-temp`);
+    if (existsSync(tempDir)) {
+      try {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      } catch (cleanupError) {
+        console.error(`[${projectId}] Failed to cleanup temp directory:`, cleanupError);
+      }
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Contract deployment failed",
+      details: error.stack
+    });
+  }
+});
+
 // Deploy endpoint with external deployment feature flags
 app.post("/deploy", requireAuth, async (req, res) => {
   const deployStartTime = Date.now();
