@@ -16,7 +16,7 @@ ENV PREVIEWS_ROOT=/tmp/previews
 WORKDIR /srv
 
 # Clone boilerplate repository
-ARG BOILERPLATE_REPO="https://github.com/chetankashetti/miniapp-preview-host"
+ARG BOILERPLATE_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
 ARG BOILERPLATE_REF="main"
 RUN git clone --filter=blob:none --depth=1 -b "$BOILERPLATE_REF" "$BOILERPLATE_REPO" /srv/boilerplate
 
