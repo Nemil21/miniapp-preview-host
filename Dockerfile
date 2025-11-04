@@ -12,7 +12,7 @@ ENV PNPM_STORE_DIR=/srv/.pnpm-store
 WORKDIR /srv
 
 # ---- (A) Bring in your boilerplate (public GitHub) ----
-ARG BOILERPLATE_REPO="https://github.com/chetankashetti/minidev-boilerplate.git"
+ARG BOILERPLATE_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
 ARG BOILERPLATE_REF="main"     # or pin a commit SHA
 RUN git clone --filter=blob:none --depth=1 -b "$BOILERPLATE_REF" "$BOILERPLATE_REPO" /srv/boilerplate
 # Prewarm pnpm store for the boilerplate to speed installs at runtime

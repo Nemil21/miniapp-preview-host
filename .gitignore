@@ -1,5 +1,11 @@
 .pnpm-store
-boilerplate
 orchestrator/node_modules
 previews
 .DS_Store
+boilerplate/node_modules
+boilerplate/.next
+boilerplate/.turbo
+boilerplate/dist
+boilerplate/build
+.env
+.env.local
