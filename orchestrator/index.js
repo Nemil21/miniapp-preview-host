@@ -21,7 +21,12 @@ const IS_RAILWAY = process.env.RAILWAY_ENVIRONMENT === "true" || process.env.FOR
 const IS_LOCAL = !IS_RAILWAY;
 
 // Paths (env-overridable, Railway-optimized)
-const BOILERPLATE = process.env.BOILERPLATE_DIR || "/srv/boilerplate";
+// Default paths based on environment
+const DEFAULT_BOILERPLATE = IS_LOCAL 
+  ? path.join(process.cwd(), "..", "boilerplate")  // Local: relative to orchestrator dir
+  : "/srv/boilerplate";  // Production: Docker build path
+
+const BOILERPLATE = process.env.BOILERPLATE_DIR || DEFAULT_BOILERPLATE;
 const PREVIEWS_ROOT = IS_RAILWAY 
   ? (process.env.PREVIEWS_ROOT || "/tmp/previews")  // Use /tmp for Railway
   : (process.env.PREVIEWS_ROOT || "/srv/previews"); // Use /srv for local
@@ -40,6 +45,7 @@ const ENABLE_VERCEL_DEPLOYMENT = process.env.ENABLE_VERCEL_DEPLOYMENT === "true"
 const ENABLE_NETLIFY_DEPLOYMENT = process.env.ENABLE_NETLIFY_DEPLOYMENT === "true";
 const ENABLE_CONTRACT_DEPLOYMENT = process.env.ENABLE_CONTRACT_DEPLOYMENT === "true";
 const DEPLOYMENT_TOKEN_SECRET = process.env.DEPLOYMENT_TOKEN_SECRET || "";
+const RETURN_DEPLOYMENT_ERRORS = process.env.RETURN_DEPLOYMENT_ERRORS === "true"; // Return errors instead of falling back to local
 const NETLIFY_TOKEN = process.env.NETLIFY_TOKEN || "";
 const BASE_SEPOLIA_RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org";
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
@@ -74,6 +80,54 @@ function makeRing(cap = 4000) {
 
 /* ========= Deployment helpers ========= */
 
+/**
+ * Disable deployment protection for a Vercel project
+ */
+async function disableVercelDeploymentProtection(vercelProjectId) {
+  try {
+    console.log(`[${vercelProjectId}] 🔓 Disabling deployment protection...`);
+    
+    // Update project settings to disable all protection types
+    const response = await fetch(`https://api.vercel.com/v1/projects/${vercelProjectId}`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        ssoProtection: null,           // Disable SSO protection
+        passwordProtection: null,      // Disable password protection
+        trustedIps: {                  // Disable IP restrictions
+          addresses: [],
+          protectionMode: null
+        },
+        optionsAllowlist: {           // Disable OPTIONS allowlist
+          paths: []
+        }
+      })
+    });
+
+    if (response.ok) {
+      console.log(`[${vercelProjectId}] ✅ Deployment protection disabled`);
+      return true;
+    } else {
+      const error = await response.text();
+      console.warn(`[${vercelProjectId}] ⚠️ Failed to disable deployment protection: ${response.status} ${error}`);
+      // Log response for debugging
+      try {
+        const errorJson = JSON.parse(error);
+        console.warn(`[${vercelProjectId}] Error details:`, JSON.stringify(errorJson, null, 2));
+      } catch (e) {
+        console.warn(`[${vercelProjectId}] Raw error:`, error);
+      }
+      return false;
+    }
+  } catch (error) {
+    console.warn(`[${vercelProjectId}] ⚠️ Error disabling deployment protection:`, error.message);
+    return false;
+  }
+}
+
 async function deployToVercel(dir, projectId, logs) {
   if (!ENABLE_VERCEL_DEPLOYMENT || !DEPLOYMENT_TOKEN_SECRET) {
     throw new Error("Vercel deployment is disabled or token not provided");
@@ -101,21 +155,61 @@ async function deployToVercel(dir, projectId, logs) {
 
     console.log(`[${projectId}] ✅ Vercel deployment completed`);
 
-    // Extract the actual deployment URL from Vercel CLI output
-    // run() returns {stdout, stderr, output}, so we need to access the string property
+    // Extract deployment-specific URL from "Production:" line
     const output = result.output || result.stdout || '';
-
-    // Look for URLs in the output (e.g., "https://project-name-xyz123.vercel.app")
-    const urlMatch = output.match(/https:\/\/[^\s]+\.vercel\.app/);
-    if (urlMatch) {
-      const deploymentUrl = urlMatch[0];
-      console.log(`[${projectId}] 🌐 Found Vercel deployment URL: ${deploymentUrl}`);
-      return deploymentUrl;
-    } else {
-      // No Vercel URL found in output, fall back to local deployment
-      console.log(`[${projectId}] ⚠️ No Vercel URL found in output, falling back to local deployment`);
-      throw new Error("Vercel deployment completed but no URL found in output");
+    const productionUrlMatch = output.match(/Production:\s+(https:\/\/[^\s]+\.vercel\.app)/);
+    
+    if (productionUrlMatch && productionUrlMatch[1]) {
+      console.log(`[${projectId}] 📋 Deployment-specific URL: ${productionUrlMatch[1]}`);
     }
+
+    // Get the actual stable domain from Vercel API
+    // Vercel truncates domain names to 63 characters, so we need to query the API
+    let stableUrl = `https://${projectId}.vercel.app`; // fallback
+    
+    try {
+      // Read project ID from .vercel/project.json
+      const vercelProjectPath = path.join(dir, ".vercel", "project.json");
+      if (await exists(vercelProjectPath)) {
+        const projectData = JSON.parse(await fs.readFile(vercelProjectPath, "utf8"));
+        const vercelProjectId = projectData.projectId;
+        
+        if (vercelProjectId) {
+          console.log(`[${projectId}] 📡 Fetching project info from Vercel API...`);
+          
+          // Disable deployment protection for this project
+          await disableVercelDeploymentProtection(vercelProjectId);
+          
+          // Query Vercel API for project details
+          const response = await fetch(`https://api.vercel.com/v9/projects/${vercelProjectId}`, {
+            headers: {
+              'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
+            }
+          });
+          
+          if (response.ok) {
+            const projectInfo = await response.json();
+            // Get the production domain (targets[0].alias)
+            if (projectInfo.targets?.production?.alias?.[0]) {
+              stableUrl = `https://${projectInfo.targets.production.alias[0]}`;
+              console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
+            } else if (projectInfo.alias?.[0]) {
+              stableUrl = `https://${projectInfo.alias[0]}`;
+              console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
+            } else {
+              console.warn(`[${projectId}] ⚠️ No alias found in API response, using fallback`);
+            }
+          } else {
+            console.warn(`[${projectId}] ⚠️ Vercel API request failed: ${response.status}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`[${projectId}] ⚠️ Could not fetch stable URL from Vercel API:`, error.message);
+    }
+    
+    console.log(`[${projectId}] 🌐 Final stable production URL: ${stableUrl}`);
+    return stableUrl;
     
   } catch (error) {
     console.error(`[${projectId}] ❌ Vercel deployment failed:`, error);
@@ -367,19 +461,25 @@ async function needInstall(dir) {
 /* ========= Preview registry & helpers ========= */
 
 const previews = new Map(); // id -> { port, proc, dir, lastHit, status, logs, lastError }
+const deploymentJobs = new Map(); // projectId -> { status, startTime, error, logs, deploymentUrl, platform }
 const proxy = httpProxy.createProxyServer({ ws: true });
 
 // prevent crashes on target errors
 proxy.on("error", (err, req, res) => {
   console.error("proxy error:", err?.message || err);
-  if (res && !res.headersSent) {
+  // Check if res is an HTTP response (has writeHead) vs WebSocket (socket)
+  if (res && typeof res.writeHead === 'function' && !res.headersSent) {
     res.writeHead(502, { "content-type": "text/plain" });
     return res.end(
-      "Preview backend isn’t reachable yet. Try again in a few seconds."
+      "Preview backend isn't reachable yet. Try again in a few seconds."
     );
   }
   try {
     req?.socket?.destroy?.();
+    // For WebSocket connections, destroy the socket
+    if (res && typeof res.destroy === 'function') {
+      res.destroy();
+    }
   } catch {}
 });
 
@@ -396,37 +496,95 @@ function nextFreePort() {
   throw new Error("No free ports available");
 }
 
+// Helper function to kill any running processes for a project
+function killProjectProcesses(projectId) {
+  const preview = previews.get(projectId);
+  if (preview && preview.proc) {
+    try {
+      console.log(`[${projectId}] Killing running process...`);
+      preview.proc.kill("SIGTERM");
+      // Wait a bit for graceful shutdown
+      return new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (err) {
+      console.warn(`[${projectId}] Error killing process:`, err.message);
+    }
+  }
+  return Promise.resolve();
+}
+
 async function copyBoilerplate(dst) {
   const startTime = Date.now();
   console.log(`[copyBoilerplate] Starting boilerplate copy to ${dst}...`);
   
-  await fs.mkdir(dst, { recursive: true });
-  
-  // copy while excluding build dirs & node_modules
-  await run("sh", [
-    "-lc",
-    `tar -C ${BOILERPLATE} -cf - . \
-      --exclude=.git --exclude=node_modules --exclude=.next --exclude=.turbo --exclude=dist --exclude=build \
-      | tar -C ${dst} -xpf -`,
-  ]);
-  
-  // safety: ensure none of these exist post-copy
-  for (const d of ["node_modules", ".next", ".turbo", "dist", "build"]) {
-    await fs.rm(path.join(dst, d), { recursive: true, force: true });
+  try {
+    await fs.mkdir(dst, { recursive: true });
+    
+    // copy while excluding build dirs & node_modules
+    await run("sh", [
+      "-lc",
+      `tar -C ${BOILERPLATE} \
+        --exclude=.git --exclude=node_modules --exclude=.next --exclude=.turbo --exclude=dist --exclude=build \
+        -cf - . | tar -C ${dst} -xpf -`,
+    ]);
+    
+    // safety: ensure none of these exist post-copy
+    for (const d of ["node_modules", ".next", ".turbo", "dist", "build"]) {
+      await fs.rm(path.join(dst, d), { recursive: true, force: true });
+    }
+    
+    console.log(`[copyBoilerplate] Boilerplate copy completed in ${Date.now() - startTime}ms`);
+  } catch (error) {
+    console.error(`[copyBoilerplate] Failed to copy boilerplate:`, error);
+    // If tar failed, try a simpler approach with fs.cp
+    console.log(`[copyBoilerplate] Retrying with fs.cp...`);
+    try {
+      await fs.cp(BOILERPLATE, dst, { 
+        recursive: true,
+        filter: (src) => {
+          // Exclude certain directories
+          const basename = path.basename(src);
+          return !['node_modules', '.next', '.turbo', 'dist', 'build', '.git'].includes(basename);
+        }
+      });
+      console.log(`[copyBoilerplate] Boilerplate copy completed with fs.cp in ${Date.now() - startTime}ms`);
+    } catch (retryError) {
+      console.error(`[copyBoilerplate] Failed to copy boilerplate with fs.cp:`, retryError);
+      throw new Error(`Failed to copy boilerplate: ${retryError.message}`);
+    }
   }
-  
-  console.log(`[copyBoilerplate] Boilerplate copy completed in ${Date.now() - startTime}ms`);
 }
 
 async function writeFiles(dir, files) {
   if (!Array.isArray(files)) return;
-  await Promise.all(
-    files.map(async (f) => {
-      const full = path.join(dir, f.path);
-      await fs.mkdir(path.dirname(full), { recursive: true });
-      await fs.writeFile(full, f.content, "utf8");
-    })
-  );  
+  
+  // Write files in batches to prevent file descriptor exhaustion and race conditions
+  const BATCH_SIZE = 10; // Process 10 files at a time
+  const batches = [];
+  
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    batches.push(files.slice(i, i + BATCH_SIZE));
+  }
+  
+  console.log(`[writeFiles] Writing ${files.length} files in ${batches.length} batches of ${BATCH_SIZE}...`);
+  
+  // Process batches sequentially to avoid overwhelming the file system
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex];
+    await Promise.all(
+      batch.map(async (f) => {
+        try {
+          const full = path.join(dir, f.path);
+          await fs.mkdir(path.dirname(full), { recursive: true });
+          await fs.writeFile(full, f.content, "utf8");
+        } catch (error) {
+          console.error(`[writeFiles] Failed to write ${f.path}:`, error.message);
+          throw error; // Re-throw to fail the deployment
+        }
+      })
+    );
+  }
+  
+  console.log(`[writeFiles] Successfully wrote all ${files.length} files`);
 }
 
 function startDev(id, dir, port, logs) {
@@ -510,13 +668,22 @@ app.post("/validate", requireAuth, async (req, res) => {
   const validationStartTime = Date.now();
   const projectId = req.body.projectId || req.body.hash;
   const files = req.body.files;
-  const validationConfig = req.body.validationConfig || {
+  
+  // Railway-specific: Force disable heavy validation to avoid memory issues
+  // Override client config on Railway - validation is already done on frontend
+  const validationConfig = IS_RAILWAY ? {
+    enableTypeScript: true,  // Force skip - memory intensive
+    enableSolidity: true,    // Force skip - memory intensive  
+    enableESLint: true,      // Force skip - memory intensive
+    enableBuild: true,       // Force skip - memory intensive
+    enableRuntimeChecks: true // Keep - lightweight
+  } : (req.body.validationConfig || {
     enableTypeScript: true,
     enableSolidity: true,
     enableESLint: true,
     enableBuild: true,
     enableRuntimeChecks: true
-  };
+  });
   
   if (!projectId) return res.status(400).json({ error: "projectId required" });
   if (!files) return res.status(400).json({ error: "files required" });
@@ -754,13 +921,41 @@ app.post("/deploy", requireAuth, async (req, res) => {
 async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime) {
   try {
     console.log(`[${projectId}] Starting external deployment to ${platform}...`);
+    
+    // Initialize deployment job in tracking map
+    deploymentJobs.set(projectId, {
+      status: 'in_progress',
+      startTime: deployStartTime,
+      platform,
+      error: null,
+      logs: '',
+      deploymentUrl: null
+    });
 
     const dir = path.join(PREVIEWS_ROOT, `${projectId}-${platform}`);
 
     // Clean existing directory
     if (existsSync(dir)) {
-      console.log(`[${projectId}] Cleaning existing deployment directory...`);
-      await fs.rm(dir, { recursive: true, force: true });
+      console.log(`[${projectId}] Cleaning existing deployment directory with retry logic...`);
+      // Retry up to 3 times with exponential backoff
+      let cleaned = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 1000 });
+          cleaned = true;
+          console.log(`[${projectId}] Directory cleaned successfully on attempt ${attempt}`);
+          break;
+        } catch (cleanError) {
+          console.warn(`[${projectId}] Clean attempt ${attempt}/3 failed:`, cleanError.message);
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          }
+        }
+      }
+      if (!cleaned) {
+        console.warn(`[${projectId}] Could not clean directory, will overwrite files instead`);
+        // Don't throw - we'll try to overwrite instead
+      }
     }
 
     // Copy boilerplate and write files
@@ -774,49 +969,129 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
       await fs.rm(pnpmLockPath, { force: true });
     }
 
-    // Install dependencies
     const logs = makeRing();
-    await npmInstall(dir, { id: projectId, storeDir: PNPM_STORE, logs });
+    
+    // Railway-specific: Skip npm install for external deployments
+    // Vercel/Netlify will handle dependency installation with more resources
+    if (!IS_RAILWAY || !FORCE_EXTERNAL_DEPLOYMENT) {
+      console.log(`[${projectId}] Installing dependencies locally...`);
+      await npmInstall(dir, { id: projectId, storeDir: PNPM_STORE, logs });
+    } else {
+      console.log(`[${projectId}] Skipping npm install - ${platform} will handle it`);
+    }
 
     // Deploy contracts to testnet if enabled
     let contractDeploymentInfo = null;
-    try {
-      contractDeploymentInfo = await deployContracts(dir, projectId, logs, skipContracts);
-      if (contractDeploymentInfo) {
-        console.log(`[${projectId}] 📄 Contract deployment info saved`);
+    
+    // Railway-specific: Skip contract deployment to avoid memory issues
+    // Contracts require npm install which exceeds Railway memory limits
+    if (IS_RAILWAY && FORCE_EXTERNAL_DEPLOYMENT) {
+      console.log(`[${projectId}] ⚠️  Skipping contract deployment on Railway (memory constraints)`);
+      console.log(`[${projectId}] Contracts will be deployed separately if needed`);
+    } else {
+      try {
+        contractDeploymentInfo = await deployContracts(dir, projectId, logs, skipContracts);
+        if (contractDeploymentInfo) {
+          console.log(`[${projectId}] 📄 Contract deployment info saved`);
+        }
+      } catch (error) {
+        console.error(`[${projectId}] ⚠️ Contract deployment skipped:`, error.message);
       }
-    } catch (error) {
-      console.error(`[${projectId}] ⚠️ Contract deployment skipped:`, error.message);
     }
 
-    // Deploy to platform
+    // Deploy to platform with timeout for immediate response
     let deploymentUrl;
     let platformEnabled = false;
     
-    try {
-      if (platform === "vercel" && ENABLE_VERCEL_DEPLOYMENT && DEPLOYMENT_TOKEN_SECRET) {
-        deploymentUrl = await deployToVercel(dir, projectId, logs);
+    // Wrap deployment in a promise that we can race against a timeout
+    const deploymentPromise = (async () => {
+      try {
+        if (platform === "vercel" && ENABLE_VERCEL_DEPLOYMENT && DEPLOYMENT_TOKEN_SECRET) {
+          deploymentUrl = await deployToVercel(dir, projectId, logs);
         platformEnabled = true;
       } else if (platform === "netlify" && ENABLE_NETLIFY_DEPLOYMENT && NETLIFY_TOKEN) {
         deploymentUrl = await deployToNetlify(dir, projectId, logs);
         platformEnabled = true;
       }
-    } catch (deploymentError) {
-      console.error(`[${projectId}] ${platform} deployment failed:`, deploymentError.message);
       
-      // Railway-specific: Don't fallback to local deployment
-      if (IS_RAILWAY && FORCE_EXTERNAL_DEPLOYMENT) {
-        return res.status(500).json({
-          success: false,
-          error: `${platform} deployment failed: ${deploymentError.message}`,
-          details: "External deployment required on Railway. Local fallback not available."
-        });
+      return { deploymentUrl, platformEnabled };
+      } catch (deploymentError) {
+        throw deploymentError;
       }
+    })();
+    
+    // Set a 2-minute threshold for immediate response
+    // If deployment isn't done by then, return in_progress and continue in background
+    const IMMEDIATE_RESPONSE_THRESHOLD = 120000; // 2 minutes
+    const timeoutPromise = new Promise(resolve => 
+      setTimeout(() => resolve({ timeout: true }), IMMEDIATE_RESPONSE_THRESHOLD)
+    );
+    
+    const result = await Promise.race([deploymentPromise, timeoutPromise]);
+    
+    // If deployment completed within threshold, return success immediately
+    if (!result.timeout) {
+      deploymentUrl = result.deploymentUrl;
+      platformEnabled = result.platformEnabled;
       
-      console.log(`[${projectId}] Falling back to local deployment`);
-      return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime);
+      // Update job status to completed
+      deploymentJobs.set(projectId, {
+        status: 'completed',
+        startTime: deployStartTime,
+        platform,
+        error: null,
+        logs: logs.text(),
+        deploymentUrl
+      });
+      
+      console.log(`[${projectId}] Deployment completed within threshold (${Date.now() - deployStartTime}ms)`);
+      // Fall through to success response below
+    } else {
+      // Deployment is taking too long, return in_progress and continue in background
+      console.log(`[${projectId}] Deployment exceeded ${IMMEDIATE_RESPONSE_THRESHOLD}ms threshold, returning in_progress...`);
+      
+      // Continue deployment in background
+      deploymentPromise.then(bgResult => {
+        deploymentUrl = bgResult.deploymentUrl;
+        platformEnabled = bgResult.platformEnabled;
+        
+        // Update job status
+        deploymentJobs.set(projectId, {
+          status: 'completed',
+          startTime: deployStartTime,
+          platform,
+          error: null,
+          logs: logs.text(),
+          deploymentUrl
+        });
+        
+        console.log(`[${projectId}] Background deployment completed in ${Date.now() - deployStartTime}ms`);
+      }).catch(bgError => {
+        // Update job with error
+        deploymentJobs.set(projectId, {
+          status: 'failed',
+          startTime: deployStartTime,
+          platform,
+          error: bgError.message,
+          logs: logs.text(),
+          deploymentUrl: null
+        });
+        
+        console.error(`[${projectId}] Background deployment failed:`, bgError.message);
+      });
+      
+      // Return in_progress response immediately
+      return res.json({
+        success: true,
+        status: 'in_progress',
+        projectId,
+        platform,
+        message: 'Deployment in progress, poll /deploy/status/:projectId for updates',
+        estimatedTime: '2-5 minutes'
+      });
     }
-
+    
+    // For deployments that completed within threshold, check if platform was enabled
     if (!platformEnabled) {
       console.log(`[${projectId}] ${platform} deployment disabled or not configured, falling back to local`);
       return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime);
@@ -853,10 +1128,17 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
 
   } catch (e) {
     console.error(`[${projectId}] External deployment failed:`, e);
+    
+    // Capture deployment logs for error analysis (logs may not be defined if error happens early)
+    const deploymentLogs = typeof logs !== 'undefined' && logs.text ? logs.text() : '';
+    const errorOutput = e.output || e.stdout || e.stderr || '';
+    
     return res.status(500).json({
       success: false,
       error: `External deployment to ${platform} failed: ${e.message}`,
-      details: e.stack
+      details: e.stack,
+      logs: deploymentLogs,
+      output: errorOutput
     });
   }
 }
@@ -882,10 +1164,31 @@ async function handleLocalDeployment(projectId, filesArray, wait, skipContracts,
 
     const dir = path.join(PREVIEWS_ROOT, projectId);
 
+    // Kill any running processes first
+    await killProjectProcesses(projectId);
+
     // Clean slate (avoid stale node_modules prompts)
     if (existsSync(dir)) {
-      console.log(`[${projectId}] Cleaning existing directory...`);
-      await fs.rm(dir, { recursive: true, force: true });
+      console.log(`[${projectId}] Cleaning existing directory with retry logic...`);
+      // Retry up to 3 times with exponential backoff
+      let cleaned = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 1000 });
+          cleaned = true;
+          console.log(`[${projectId}] Directory cleaned successfully on attempt ${attempt}`);
+          break;
+        } catch (cleanError) {
+          console.warn(`[${projectId}] Clean attempt ${attempt}/3 failed:`, cleanError.message);
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          }
+        }
+      }
+      if (!cleaned) {
+        console.warn(`[${projectId}] Could not clean directory, will overwrite files instead`);
+        // Don't throw - we'll try to overwrite instead
+      }
     }
 
     // Fresh: copy boilerplate, write deltas
@@ -971,8 +1274,23 @@ async function handleLocalDeployment(projectId, filesArray, wait, skipContracts,
 app.post("/previews", requireAuth, async (req, res) => {
   const id = req.body.id;
   const files = req.body.files;
+  const validationResult = req.body.validationResult; // NEW: Optional validation result
   const wait = req.body.wait ?? true; // default: wait for readiness
   if (!id) return res.status(400).json({ error: "id required" });
+
+  // NEW: Check validation result before allowing deployment
+  if (validationResult && !validationResult.success) {
+    console.error(`[${id}] ❌ Validation failed - blocking deployment`);
+    console.error(`[${id}] ❌ Errors: ${validationResult.errors.length}`);
+    console.error(`[${id}] ⚠️  Warnings: ${validationResult.warnings.length}`);
+    
+    return res.status(400).json({
+      error: "Validation failed - cannot deploy files with compilation errors",
+      validationErrors: validationResult.errors,
+      validationWarnings: validationResult.warnings,
+      success: false
+    });
+  }
 
   try {
     // If running, patch files and return
@@ -1044,8 +1362,31 @@ app.post("/previews", requireAuth, async (req, res) => {
     // Local environment: Create new local preview
     const dir = path.join(PREVIEWS_ROOT, id);
 
+    // Kill any running processes first
+    await killProjectProcesses(id);
+
     // Clean slate (avoid stale node_modules prompts)
-    if (existsSync(dir)) await fs.rm(dir, { recursive: true, force: true });
+    if (existsSync(dir)) {
+      console.log(`[${id}] Cleaning existing directory with retry logic...`);
+      // Retry up to 3 times with exponential backoff
+      let cleaned = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 1000 });
+          cleaned = true;
+          break;
+        } catch (cleanError) {
+          console.warn(`[${id}] Clean attempt ${attempt}/3 failed:`, cleanError.message);
+          if (attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          }
+        }
+      }
+      if (!cleaned) {
+        console.warn(`[${id}] Could not clean directory, will overwrite files instead`);
+        // Don't throw - we'll try to overwrite instead
+      }
+    }
 
     // Fresh: copy boilerplate, write deltas
     await copyBoilerplate(dir);
@@ -1123,6 +1464,40 @@ app.get("/previews/:id/logs", (req, res) => {
   res.type("text/plain").send(p.logs?.text?.() || "");
 });
 
+// Deployment job status endpoint (for polling)
+app.get("/deploy/status/:projectId", requireAuth, (req, res) => {
+  const projectId = req.params.projectId;
+  const job = deploymentJobs.get(projectId);
+  
+  if (!job) {
+    return res.status(404).json({ 
+      error: "Deployment job not found",
+      projectId 
+    });
+  }
+  
+  const response = {
+    projectId,
+    status: job.status, // 'in_progress', 'completed', 'failed'
+    startTime: job.startTime,
+    duration: Date.now() - job.startTime,
+    platform: job.platform
+  };
+  
+  // Include result data based on status
+  if (job.status === 'completed') {
+    response.deploymentUrl = job.deploymentUrl;
+    response.success = true;
+  } else if (job.status === 'failed') {
+    response.error = job.error;
+    response.logs = job.logs;
+    response.success = false;
+  }
+  
+  console.log(`[${projectId}] Status check: ${job.status}`);
+  res.json(response);
+});
+
 // Health check endpoint (Railway-specific)
 app.get("/health", (req, res) => {
   res.json({ 
@@ -1162,6 +1537,21 @@ app.use("/p/:id", async (req, res) => {
 
     const dir = path.join(PREVIEWS_ROOT, id);
     if (existsSync(dir)) {
+      // Validate directory has required files before attempting restart
+      const packageJsonPath = path.join(dir, 'package.json');
+      const srcPath = path.join(dir, 'src');
+      
+      if (!existsSync(packageJsonPath) || !existsSync(srcPath)) {
+        console.warn(`[${id}] Corrupted preview directory detected, cleaning up...`);
+        try {
+          await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 1000 });
+          console.log(`[${id}] Corrupted directory cleaned successfully`);
+        } catch (cleanError) {
+          console.error(`[${id}] Failed to clean corrupted directory:`, cleanError);
+        }
+        return res.status(404).send("Preview not found (corrupted directory was cleaned)");
+      }
+
       const logs = makeRing();
 
       // ensure deps (safe if already present)
@@ -1357,8 +1747,25 @@ const appStart = async () => {
   console.log(`Vercel enabled: ${ENABLE_VERCEL_DEPLOYMENT}`);
   console.log(`Netlify enabled: ${ENABLE_NETLIFY_DEPLOYMENT}`);
   console.log(`Contract deployment enabled: ${ENABLE_CONTRACT_DEPLOYMENT}`);
+  console.log(`Boilerplate path: ${BOILERPLATE}`);
+  console.log(`Previews root: ${PREVIEWS_ROOT}`);
   
-  server.listen(PORT, () => console.log(`Listening on ${PORT}`));
+  // Verify boilerplate exists
+  if (!(await exists(BOILERPLATE))) {
+    console.error(`❌ BOILERPLATE DIRECTORY NOT FOUND: ${BOILERPLATE}`);
+    console.error(`   Please check:`);
+    if (IS_LOCAL) {
+      console.error(`   - Ensure the boilerplate directory exists at: ${path.resolve(BOILERPLATE)}`);
+    } else {
+      console.error(`   - Docker build included the boilerplate`);
+      console.error(`   - BOILERPLATE_DIR environment variable is set correctly (should be /srv/boilerplate)`);
+      console.error(`   - Current BOILERPLATE_DIR: ${process.env.BOILERPLATE_DIR || 'not set'}`);
+    }
+    throw new Error(`Boilerplate directory not found: ${BOILERPLATE}`);
+  }
+  console.log(`✅ Boilerplate directory verified`);
+  
+  server.listen(PORT, '0.0.0.0', () => console.log(`Listening on ${PORT}`));
 };
 
 appStart().catch((e) => {
