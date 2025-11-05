@@ -407,6 +407,8 @@ export class RailwayCompilationValidator {
     await fs.mkdir(tempDir, { recursive: true });
     
     // Copy essential config files from boilerplate
+    // NOTE: hardhat.config.js/ts are NOT included here because they should stay in contracts/ directory
+    // Including them in the root causes Next.js build failures
     const configFiles = [
       'package.json',
       'tsconfig.json',
@@ -417,9 +419,7 @@ export class RailwayCompilationValidator {
       'eslint.config.mjs',
       'eslint.config.js',
       '.eslintrc.json',
-      '.eslintrc.js',
-      'hardhat.config.js',
-      'hardhat.config.ts'
+      '.eslintrc.js'
     ];
     
     for (const configFile of configFiles) {
