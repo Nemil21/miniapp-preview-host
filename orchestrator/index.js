@@ -103,7 +103,7 @@ async function disableVercelDeploymentProtection(vercelProjectId) {
         passwordProtection: null,      // Disable password protection
         trustedIps: {                  // Disable IP restrictions
           addresses: [],
-          protectionMode: null
+          deploymentType: "all"        // Required: all, preview, or production
         },
         optionsAllowlist: {           // Disable OPTIONS allowlist
           paths: []
