@@ -48,6 +48,10 @@ const DEPLOYMENT_TOKEN_SECRET = process.env.DEPLOYMENT_TOKEN_SECRET || "";
 const RETURN_DEPLOYMENT_ERRORS = process.env.RETURN_DEPLOYMENT_ERRORS === "true"; // Return errors instead of falling back to local
 const NETLIFY_TOKEN = process.env.NETLIFY_TOKEN || "";
 const BASE_SEPOLIA_RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org";
+
+// Custom domain configuration
+const CUSTOM_DOMAIN_BASE = process.env.CUSTOM_DOMAIN_BASE || "minidev.fun"; // Base domain for custom subdomains
+const ENABLE_CUSTOM_DOMAINS = process.env.ENABLE_CUSTOM_DOMAINS === "true"; // Enable custom domain assignment
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 
 // Railway-specific: Force external deployment
@@ -128,6 +132,65 @@ async function disableVercelDeploymentProtection(vercelProjectId) {
   }
 }
 
+/**
+ * Assign custom domain to Vercel project
+ * @param {string} vercelProjectId - The Vercel project ID
+ * @param {string} projectId - The project ID (used as subdomain)
+ * @returns {Promise<string|null>} - The custom domain URL if successful, null otherwise
+ */
+async function assignCustomDomain(vercelProjectId, projectId) {
+  if (!ENABLE_CUSTOM_DOMAINS) {
+    console.log(`[${projectId}] Custom domains disabled, skipping`);
+    return null;
+  }
+
+  try {
+    const customDomain = `${projectId}.${CUSTOM_DOMAIN_BASE}`;
+    console.log(`[${projectId}] 🌐 Assigning custom domain: ${customDomain}`);
+    
+    // Add domain to Vercel project
+    const addDomainResponse = await fetch(`https://api.vercel.com/v10/projects/${vercelProjectId}/domains`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: customDomain
+      })
+    });
+
+    if (addDomainResponse.ok) {
+      const domainData = await addDomainResponse.json();
+      console.log(`[${projectId}] ✅ Custom domain assigned: ${customDomain}`);
+      console.log(`[${projectId}] Domain verification required: ${domainData.verified === false ? 'Yes (DNS should auto-verify if configured)' : 'No'}`);
+      
+      return `https://${customDomain}`;
+    } else {
+      const errorText = await addDomainResponse.text();
+      let errorData;
+      try {
+        errorData = JSON.parse(errorText);
+      } catch (e) {
+        errorData = { message: errorText };
+      }
+      
+      // Check if domain already exists (not an error)
+      if (addDomainResponse.status === 409 || errorData.error?.code === 'domain_already_exists') {
+        console.log(`[${projectId}] ℹ️ Custom domain already exists: ${customDomain}`);
+        return `https://${customDomain}`;
+      }
+      
+      console.warn(`[${projectId}] ⚠️ Failed to assign custom domain: ${addDomainResponse.status}`);
+      console.warn(`[${projectId}] Error details:`, JSON.stringify(errorData, null, 2));
+      return null;
+    }
+  } catch (error) {
+    console.warn(`[${projectId}] ⚠️ Error assigning custom domain:`, error.message);
+    return null;
+  }
+}
+
 async function deployToVercel(dir, projectId, logs) {
   if (!ENABLE_VERCEL_DEPLOYMENT || !DEPLOYMENT_TOKEN_SECRET) {
     throw new Error("Vercel deployment is disabled or token not provided");
@@ -180,27 +243,36 @@ async function deployToVercel(dir, projectId, logs) {
           // Disable deployment protection for this project
           await disableVercelDeploymentProtection(vercelProjectId);
           
-          // Query Vercel API for project details
-          const response = await fetch(`https://api.vercel.com/v9/projects/${vercelProjectId}`, {
-            headers: {
-              'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
-            }
-          });
+          // Assign custom domain to this project
+          const customDomainUrl = await assignCustomDomain(vercelProjectId, projectId);
           
-          if (response.ok) {
-            const projectInfo = await response.json();
-            // Get the production domain (targets[0].alias)
-            if (projectInfo.targets?.production?.alias?.[0]) {
-              stableUrl = `https://${projectInfo.targets.production.alias[0]}`;
-              console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
-            } else if (projectInfo.alias?.[0]) {
-              stableUrl = `https://${projectInfo.alias[0]}`;
-              console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
-            } else {
-              console.warn(`[${projectId}] ⚠️ No alias found in API response, using fallback`);
-            }
+          // If custom domain was successfully assigned, use it
+          if (customDomainUrl) {
+            stableUrl = customDomainUrl;
+            console.log(`[${projectId}] 🌐 Using custom domain: ${stableUrl}`);
           } else {
-            console.warn(`[${projectId}] ⚠️ Vercel API request failed: ${response.status}`);
+            // Fallback to querying Vercel API for default domain
+            const response = await fetch(`https://api.vercel.com/v9/projects/${vercelProjectId}`, {
+              headers: {
+                'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
+              }
+            });
+            
+            if (response.ok) {
+              const projectInfo = await response.json();
+              // Get the production domain (targets[0].alias)
+              if (projectInfo.targets?.production?.alias?.[0]) {
+                stableUrl = `https://${projectInfo.targets.production.alias[0]}`;
+                console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
+              } else if (projectInfo.alias?.[0]) {
+                stableUrl = `https://${projectInfo.alias[0]}`;
+                console.log(`[${projectId}] 🌐 Vercel stable production URL from API: ${stableUrl}`);
+              } else {
+                console.warn(`[${projectId}] ⚠️ No alias found in API response, using fallback`);
+              }
+            } else {
+              console.warn(`[${projectId}] ⚠️ Vercel API request failed: ${response.status}`);
+            }
           }
         }
       }
