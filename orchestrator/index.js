@@ -175,9 +175,65 @@ async function assignCustomDomain(vercelProjectId, projectId) {
         errorData = { message: errorText };
       }
       
-      // Check if domain already exists (not an error)
+      // Check if domain already exists
       if (addDomainResponse.status === 409 || errorData.error?.code === 'domain_already_exists') {
         console.log(`[${projectId}] ℹ️ Custom domain already exists: ${customDomain}`);
+        console.log(`[${projectId}] 🔄 Checking if domain is assigned to correct project...`);
+        
+        // Try to remove from all projects and re-add to this one
+        try {
+          // First, find which project it's assigned to
+          const domainsResponse = await fetch(`https://api.vercel.com/v6/domains/${customDomain}`, {
+            headers: {
+              'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
+            }
+          });
+          
+          if (domainsResponse.ok) {
+            const domainInfo = await domainsResponse.json();
+            console.log(`[${projectId}] 📋 Domain currently points to project: ${domainInfo.projectId || 'unknown'}`);
+            
+            // If it's assigned to a different project, remove it first
+            if (domainInfo.projectId && domainInfo.projectId !== vercelProjectId) {
+              console.log(`[${projectId}] 🗑️ Removing domain from old project: ${domainInfo.projectId}`);
+              
+              const removeResponse = await fetch(`https://api.vercel.com/v9/projects/${domainInfo.projectId}/domains/${customDomain}`, {
+                method: 'DELETE',
+                headers: {
+                  'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
+                }
+              });
+              
+              if (removeResponse.ok || removeResponse.status === 404) {
+                console.log(`[${projectId}] ✅ Domain removed from old project`);
+                
+                // Now try to add it to the new project
+                const retryAddResponse = await fetch(`https://api.vercel.com/v10/projects/${vercelProjectId}/domains`, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    name: customDomain
+                  })
+                });
+                
+                if (retryAddResponse.ok) {
+                  console.log(`[${projectId}] ✅ Domain re-assigned to new project`);
+                  return `https://${customDomain}`;
+                } else {
+                  console.warn(`[${projectId}] ⚠️ Failed to re-assign domain:`, await retryAddResponse.text());
+                }
+              }
+            } else {
+              console.log(`[${projectId}] ℹ️ Domain is already assigned to this project`);
+            }
+          }
+        } catch (reassignError) {
+          console.warn(`[${projectId}] ⚠️ Error reassigning domain:`, reassignError.message);
+        }
+        
         return `https://${customDomain}`;
       }
       
@@ -209,7 +265,17 @@ async function deployToVercel(dir, projectId, logs) {
     console.log(`[${projectId}] Using npx to run Vercel CLI...`);
     
     // Deploy to Vercel using npx (more reliable in containerized environments)
-    const result = await run("npx", ["vercel", "--token", DEPLOYMENT_TOKEN_SECRET, "--name", projectId, "--prod", "--confirm", "--public"], {
+    // Add --scope parameter if VERCEL_TEAM_ID is set (for team deployments)
+    const vercelArgs = ["vercel", "--token", DEPLOYMENT_TOKEN_SECRET, "--name", projectId, "--prod", "--confirm", "--public"];
+    
+    // If deploying to a team, add scope
+    const vercelTeam = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID;
+    if (vercelTeam) {
+      console.log(`[${projectId}] Deploying to team/org: ${vercelTeam}`);
+      vercelArgs.push("--scope", vercelTeam);
+    }
+    
+    const result = await run("npx", vercelArgs, {
       id: projectId,
       cwd: dir,
       env: { ...env, DEPLOYMENT_TOKEN_SECRET, CI: "1" },
