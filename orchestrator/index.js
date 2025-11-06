@@ -51,11 +51,16 @@ const BASE_SEPOLIA_RPC_URL = process.env.BASE_SEPOLIA_RPC_URL || "https://sepoli
 
 // Custom domain configuration
 const CUSTOM_DOMAIN_BASE = process.env.CUSTOM_DOMAIN_BASE || "minidev.fun"; // Base domain for custom subdomains
+// NOTE: Custom domains disabled by default - each subdomain requires DNS verification
+// For multi-tenant platforms, use the subdomain router approach (see SUBDOMAIN_ROUTER_SOLUTION.md)
 const ENABLE_CUSTOM_DOMAINS = process.env.ENABLE_CUSTOM_DOMAINS === "true"; // Enable custom domain assignment
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 
 // Railway-specific: Force external deployment
 const FORCE_EXTERNAL_DEPLOYMENT = process.env.FORCE_EXTERNAL_DEPLOYMENT === "true";
+
+// Miniapp creator URL for callbacks (job status updates)
+const MINIAPP_CREATOR_URL = process.env.MINIAPP_CREATOR_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
 /* ========= Small utils ========= */
 
@@ -82,17 +87,60 @@ function makeRing(cap = 4000) {
   };
 }
 
+/**
+ * Notify miniapp-creator that a job has failed due to background deployment failure
+ */
+async function notifyJobFailure(jobId, projectId, error, logs) {
+  if (!jobId) {
+    console.log(`[${projectId}] No jobId provided, skipping job failure notification`);
+    return;
+  }
+
+  try {
+    console.log(`[${projectId}] 📞 Notifying miniapp-creator of job failure for jobId: ${jobId}`);
+    
+    const response = await fetch(`${MINIAPP_CREATOR_URL}/api/jobs/${jobId}/fail`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        error: error || 'Background deployment failed',
+        logs: logs || '',
+        deploymentError: error || 'Background deployment failed'
+      })
+    });
+
+    if (response.ok) {
+      console.log(`[${projectId}] ✅ Job ${jobId} marked as failed in database`);
+    } else {
+      const errorText = await response.text();
+      console.error(`[${projectId}] ❌ Failed to notify job failure: ${response.status} ${errorText}`);
+    }
+  } catch (notifyError) {
+    console.error(`[${projectId}] ❌ Error notifying job failure:`, notifyError.message);
+  }
+}
+
 /* ========= Deployment helpers ========= */
 
 /**
  * Disable deployment protection for a Vercel project
  */
-async function disableVercelDeploymentProtection(vercelProjectId) {
+async function disableVercelDeploymentProtection(vercelProjectId, teamId = null) {
   try {
     console.log(`[${vercelProjectId}] 🔓 Disabling deployment protection...`);
     
+    // Build API URL with team ID if provided
+    let apiUrl = `https://api.vercel.com/v1/projects/${vercelProjectId}`;
+    if (teamId) {
+      apiUrl += `?teamId=${teamId}`;
+      console.log(`[${vercelProjectId}] Using team ID: ${teamId}`);
+    }
+    
     // Update project settings to disable all protection types
-    const response = await fetch(`https://api.vercel.com/v1/projects/${vercelProjectId}`, {
+    const response = await fetch(apiUrl, {
       method: 'PATCH',
       headers: {
         'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`,
@@ -100,14 +148,9 @@ async function disableVercelDeploymentProtection(vercelProjectId) {
       },
       body: JSON.stringify({
         ssoProtection: null,           // Disable SSO protection
-        passwordProtection: null,      // Disable password protection
-        trustedIps: {                  // Disable IP restrictions
-          addresses: [],
-          deploymentType: "all"        // Required: all, preview, or production
-        },
-        optionsAllowlist: {           // Disable OPTIONS allowlist
-          paths: []
-        }
+        passwordProtection: null       // Disable password protection
+        // Note: Don't set trustedIps to empty array - it requires at least 1 item
+        // Omitting it leaves it unchanged, which is fine
       })
     });
 
@@ -136,9 +179,10 @@ async function disableVercelDeploymentProtection(vercelProjectId) {
  * Assign custom domain to Vercel project
  * @param {string} vercelProjectId - The Vercel project ID
  * @param {string} projectId - The project ID (used as subdomain)
+ * @param {string|null} teamId - The Vercel team ID (if deploying to a team)
  * @returns {Promise<string|null>} - The custom domain URL if successful, null otherwise
  */
-async function assignCustomDomain(vercelProjectId, projectId) {
+async function assignCustomDomain(vercelProjectId, projectId, teamId = null) {
   if (!ENABLE_CUSTOM_DOMAINS) {
     console.log(`[${projectId}] Custom domains disabled, skipping`);
     return null;
@@ -148,8 +192,15 @@ async function assignCustomDomain(vercelProjectId, projectId) {
     const customDomain = `${projectId}.${CUSTOM_DOMAIN_BASE}`;
     console.log(`[${projectId}] 🌐 Assigning custom domain: ${customDomain}`);
     
+    // Build API URL with team ID if provided
+    let apiUrl = `https://api.vercel.com/v10/projects/${vercelProjectId}/domains`;
+    if (teamId) {
+      apiUrl += `?teamId=${teamId}`;
+      console.log(`[${projectId}] Using team ID for domain assignment: ${teamId}`);
+    }
+    
     // Add domain to Vercel project
-    const addDomainResponse = await fetch(`https://api.vercel.com/v10/projects/${vercelProjectId}/domains`, {
+    const addDomainResponse = await fetch(apiUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`,
@@ -306,11 +357,14 @@ async function deployToVercel(dir, projectId, logs) {
         if (vercelProjectId) {
           console.log(`[${projectId}] 📡 Fetching project info from Vercel API...`);
           
+          // Get team ID if deploying to a team
+          const vercelTeam = process.env.VERCEL_TEAM_ID || process.env.VERCEL_ORG_ID;
+          
           // Disable deployment protection for this project
-          await disableVercelDeploymentProtection(vercelProjectId);
+          await disableVercelDeploymentProtection(vercelProjectId, vercelTeam);
           
           // Assign custom domain to this project
-          const customDomainUrl = await assignCustomDomain(vercelProjectId, projectId);
+          const customDomainUrl = await assignCustomDomain(vercelProjectId, projectId, vercelTeam);
           
           // If custom domain was successfully assigned, use it
           if (customDomainUrl) {
@@ -318,7 +372,12 @@ async function deployToVercel(dir, projectId, logs) {
             console.log(`[${projectId}] 🌐 Using custom domain: ${stableUrl}`);
           } else {
             // Fallback to querying Vercel API for default domain
-            const response = await fetch(`https://api.vercel.com/v9/projects/${vercelProjectId}`, {
+            let projectApiUrl = `https://api.vercel.com/v9/projects/${vercelProjectId}`;
+            if (vercelTeam) {
+              projectApiUrl += `?teamId=${vercelTeam}`;
+            }
+            
+            const response = await fetch(projectApiUrl, {
               headers: {
                 'Authorization': `Bearer ${DEPLOYMENT_TOKEN_SECRET}`
               }
@@ -1008,6 +1067,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
   const deployToExternal = req.body.deployToExternal; // platform: "vercel" | "netlify" | undefined
   const isWeb3 = req.body.isWeb3;
   const skipContracts = req.body.skipContracts ?? false; // default: false (deploy contracts if they exist)
+  const jobId = req.body.jobId; // Job ID for background deployment error reporting
 
   if (!projectId) return res.status(400).json({ error: "hash required" });
   if (!files) return res.status(400).json({ error: "files required" });
@@ -1035,7 +1095,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
         ((effectiveDeployToExternal === "vercel" && ENABLE_VERCEL_DEPLOYMENT) ||
          (effectiveDeployToExternal === "netlify" && ENABLE_NETLIFY_DEPLOYMENT))) {
       console.log(`[${projectId}] External deployment requested to ${effectiveDeployToExternal}`);
-      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime);
+      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime, jobId);
     }
 
     // Railway-specific: Return error if external deployment not available
@@ -1056,9 +1116,10 @@ app.post("/deploy", requireAuth, async (req, res) => {
 });
 
 // Handle external deployment logic
-async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime) {
+async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime, jobId) {
   try {
     console.log(`[${projectId}] Starting external deployment to ${platform}...`);
+    console.log(`[${projectId}] JobId: ${jobId || 'not provided'}`);
     
     // Initialize deployment job in tracking map
     deploymentJobs.set(projectId, {
@@ -1067,7 +1128,8 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
       platform,
       error: null,
       logs: '',
-      deploymentUrl: null
+      deploymentUrl: null,
+      jobId // Store jobId for error reporting
     });
 
     const dir = path.join(PREVIEWS_ROOT, `${projectId}-${platform}`);
@@ -1204,18 +1266,27 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
         });
         
         console.log(`[${projectId}] Background deployment completed in ${Date.now() - deployStartTime}ms`);
-      }).catch(bgError => {
+      }).catch(async (bgError) => {
+        const errorLogs = logs.text();
+        
         // Update job with error
         deploymentJobs.set(projectId, {
           status: 'failed',
           startTime: deployStartTime,
           platform,
           error: bgError.message,
-          logs: logs.text(),
-          deploymentUrl: null
+          logs: errorLogs,
+          deploymentUrl: null,
+          jobId
         });
         
         console.error(`[${projectId}] Background deployment failed:`, bgError.message);
+        
+        // Notify miniapp-creator to update job status to failed
+        const deploymentJob = deploymentJobs.get(projectId);
+        if (deploymentJob && deploymentJob.jobId) {
+          await notifyJobFailure(deploymentJob.jobId, projectId, bgError.message, errorLogs);
+        }
       });
       
       // Return in_progress response immediately
