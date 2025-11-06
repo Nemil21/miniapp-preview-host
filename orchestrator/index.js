@@ -87,6 +87,33 @@ function makeRing(cap = 4000) {
   };
 }
 
+  /**
+ * Extract meaningful error from deployment logs
+ */
+function extractErrorFromLogs(logs) {
+  if (!logs) return null;
+  
+  // Try to find TypeScript errors
+  const tsErrorMatch = logs.match(/Type error:([^\n]+(?:\n(?![\s]*$)[^\n]+)*)/);
+  if (tsErrorMatch) {
+    return `TypeScript Error: ${tsErrorMatch[1].trim()}`;
+  }
+  
+  // Try to find ESLint errors
+  const eslintErrorMatch = logs.match(/Error:([^\n]+(?:\n(?![\s]*$)[^\n]+)*)/);
+  if (eslintErrorMatch) {
+    return `Build Error: ${eslintErrorMatch[1].trim()}`;
+  }
+  
+  // Try to find "Failed to compile" errors
+  const compileErrorMatch = logs.match(/Failed to compile\.([\s\S]{0,500})/);
+  if (compileErrorMatch) {
+    return `Compilation Failed: ${compileErrorMatch[1].trim()}`;
+  }
+  
+  return null;
+}
+
 /**
  * Notify miniapp-creator that a job has failed due to background deployment failure
  */
@@ -99,6 +126,12 @@ async function notifyJobFailure(jobId, projectId, error, logs) {
   try {
     console.log(`[${projectId}] 📞 Notifying miniapp-creator of job failure for jobId: ${jobId}`);
     
+    // Extract detailed error from logs
+    const detailedError = extractErrorFromLogs(logs);
+    const deploymentError = detailedError || error || 'Background deployment failed';
+    
+    console.log(`[${projectId}] 📋 Detailed error: ${deploymentError.substring(0, 200)}`);
+    
     const response = await fetch(`${MINIAPP_CREATOR_URL}/api/jobs/${jobId}/fail`, {
       method: 'POST',
       headers: {
@@ -108,7 +141,7 @@ async function notifyJobFailure(jobId, projectId, error, logs) {
       body: JSON.stringify({
         error: error || 'Background deployment failed',
         logs: logs || '',
-        deploymentError: error || 'Background deployment failed'
+        deploymentError: deploymentError
       })
     });
 
