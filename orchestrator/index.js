@@ -513,6 +513,22 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
   console.log(`[${projectId}] 🚀 Deploying contracts to Base Sepolia testnet...`);
 
   try {
+    // Validate environment variables
+    if (!PRIVATE_KEY) {
+      const errorMsg = `Contract deployment requires PRIVATE_KEY environment variable. Please set PRIVATE_KEY in your environment.`;
+      console.error(`[${projectId}] ❌ ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+    
+    if (!BASE_SEPOLIA_RPC_URL) {
+      const errorMsg = `Contract deployment requires BASE_SEPOLIA_RPC_URL environment variable. Using default: https://sepolia.base.org`;
+      console.warn(`[${projectId}] ⚠️ ${errorMsg}`);
+    }
+    
+    console.log(`[${projectId}] ✅ Environment variables validated`);
+    console.log(`[${projectId}] 🔑 PRIVATE_KEY: ${PRIVATE_KEY ? 'SET (length: ' + PRIVATE_KEY.length + ')' : 'NOT SET'}`);
+    console.log(`[${projectId}] 🌐 BASE_SEPOLIA_RPC_URL: ${BASE_SEPOLIA_RPC_URL || 'NOT SET'}`);
+
     // Check for package.json in contracts directory
     const packageJsonPath = path.join(contractsDir, "package.json");
     if (!(await exists(packageJsonPath))) {
@@ -520,9 +536,26 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
       return null;
     }
 
+    // Check if contracts directory has any .sol files
+    const contractsSourceDir = path.join(contractsDir, "src");
+    if (await exists(contractsSourceDir)) {
+      console.log(`[${projectId}] 📁 Found contracts source directory: ${contractsSourceDir}`);
+    } else {
+      console.warn(`[${projectId}] ⚠️ No 'src' directory found in contracts folder`);
+    }
+
     // Install dependencies
     console.log(`[${projectId}] Installing contract dependencies...`);
-    await run("npm", ["install"], { id: projectId, cwd: contractsDir, logs });
+    try {
+      await run("npm", ["install"], { id: projectId, cwd: contractsDir, logs });
+      console.log(`[${projectId}] ✅ Dependencies installed successfully`);
+    } catch (installError) {
+      console.error(`[${projectId}] ❌ Failed to install dependencies:`, installError.message);
+      if (installError.stderr) {
+        console.error(`[${projectId}] 📄 npm install stderr:`, installError.stderr);
+      }
+      throw installError;
+    }
 
     // Clean previous compilation artifacts
     console.log(`[${projectId}] Cleaning previous compilation artifacts...`);
@@ -534,7 +567,28 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
 
     // Compile contracts
     console.log(`[${projectId}] Compiling contracts...`);
-    await run("npx", ["hardhat", "compile"], { id: projectId, cwd: contractsDir, logs });
+    try {
+      await run("npx", ["hardhat", "compile"], { id: projectId, cwd: contractsDir, logs });
+      console.log(`[${projectId}] ✅ Contracts compiled successfully`);
+    } catch (compileError) {
+      console.error(`[${projectId}] ❌ Contract compilation failed:`, compileError.message);
+      if (compileError.stderr) {
+        console.error(`[${projectId}] 📄 Compilation stderr:`, compileError.stderr);
+      }
+      if (compileError.stdout) {
+        console.error(`[${projectId}] 📄 Compilation stdout:`, compileError.stdout);
+      }
+      throw compileError;
+    }
+
+    // Check if deploy script exists
+    const deployScriptPath = path.join(contractsDir, "scripts", "deploy.js");
+    if (!(await exists(deployScriptPath))) {
+      const errorMsg = `Deploy script not found at ${deployScriptPath}`;
+      console.error(`[${projectId}] ❌ ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+    console.log(`[${projectId}] ✅ Deploy script found`);
 
     // Deploy to Base Sepolia
     console.log(`[${projectId}] Deploying to Base Sepolia testnet...`);
@@ -545,12 +599,24 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
       HARDHAT_NETWORK: "baseSepolia"
     };
 
-    await run("npx", ["hardhat", "run", "scripts/deploy.js", "--network", "baseSepolia"], {
-      id: projectId,
-      cwd: contractsDir,
-      env,
-      logs
-    });
+    try {
+      await run("npx", ["hardhat", "run", "scripts/deploy.js", "--network", "baseSepolia"], {
+        id: projectId,
+        cwd: contractsDir,
+        env,
+        logs
+      });
+      console.log(`[${projectId}] ✅ Deployment script completed successfully`);
+    } catch (deployError) {
+      console.error(`[${projectId}] ❌ Deployment script failed:`, deployError.message);
+      if (deployError.stderr) {
+        console.error(`[${projectId}] 📄 Deployment stderr:`, deployError.stderr);
+      }
+      if (deployError.stdout) {
+        console.error(`[${projectId}] 📄 Deployment stdout:`, deployError.stdout);
+      }
+      throw deployError;
+    }
 
     console.log(`[${projectId}] ✅ Contract deployment completed`);
 
@@ -565,7 +631,23 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
 
   } catch (error) {
     console.error(`[${projectId}] ❌ Contract deployment failed:`, error);
-    throw error;
+    
+    // Log detailed error information for debugging
+    if (error.stdout) {
+      console.error(`[${projectId}] 📄 Contract deployment stdout:`, error.stdout);
+    }
+    if (error.stderr) {
+      console.error(`[${projectId}] 📄 Contract deployment stderr:`, error.stderr);
+    }
+    
+    // Enhance error message with actual output
+    const enhancedError = new Error(error.message || 'Contract deployment failed');
+    enhancedError.stdout = error.stdout || '';
+    enhancedError.stderr = error.stderr || '';
+    enhancedError.output = error.output || '';
+    enhancedError.originalStack = error.stack;
+    
+    throw enhancedError;
   }
 }
 
@@ -1089,6 +1171,14 @@ app.post("/deploy-contracts", requireAuth, async (req, res) => {
 
   } catch (error) {
     console.error(`[${projectId}] ❌ Contract deployment failed after ${Date.now() - deployStartTime}ms:`, error);
+    
+    // Log the actual error output for debugging
+    if (error.stdout) {
+      console.error(`[${projectId}] 📄 stdout:`, error.stdout);
+    }
+    if (error.stderr) {
+      console.error(`[${projectId}] 📄 stderr:`, error.stderr);
+    }
 
     // Clean up temp directory on error
     const tempDir = path.join(PREVIEWS_ROOT, `${projectId}-contracts-temp`);
@@ -1100,10 +1190,19 @@ app.post("/deploy-contracts", requireAuth, async (req, res) => {
       }
     }
 
+    // Extract the real error message from stdout/stderr if available
+    const realError = error.stderr || error.stdout || error.message || "Contract deployment failed";
+    const errorMessage = realError.includes('npx exited 1') ? 
+      `Contract deployment failed. Check the logs for details.\n\nStderr: ${error.stderr || 'none'}\n\nStdout: ${error.stdout || 'none'}` : 
+      realError;
+
     return res.status(500).json({
       success: false,
       error: error.message || "Contract deployment failed",
-      details: error.stack
+      details: errorMessage,
+      stdout: error.stdout || '',
+      stderr: error.stderr || '',
+      stack: error.stack
     });
   }
 });
