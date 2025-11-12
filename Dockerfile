@@ -11,12 +11,20 @@ ENV PNPM_STORE_DIR=/srv/.pnpm-store
 
 WORKDIR /srv
 
-# ---- (A) Bring in your boilerplate (public GitHub) ----
-ARG BOILERPLATE_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
-ARG BOILERPLATE_REF="main"     # or pin a commit SHA
-RUN git clone --filter=blob:none --depth=1 -b "$BOILERPLATE_REF" "$BOILERPLATE_REPO" /srv/boilerplate
-# Prewarm pnpm store for the boilerplate to speed installs at runtime
-RUN cd /srv/boilerplate && pnpm fetch
+# ---- (A) Bring in your boilerplates (public GitHub) ----
+# Clone Farcaster boilerplate repository
+ARG FARCASTER_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
+ARG FARCASTER_REF="main"     # or pin a commit SHA
+RUN git clone --filter=blob:none --depth=1 -b "$FARCASTER_REF" "$FARCASTER_REPO" /srv/boilerplate-farcaster
+# Prewarm pnpm store for the Farcaster boilerplate to speed installs at runtime
+RUN cd /srv/boilerplate-farcaster && pnpm fetch
+
+# Clone Web3 boilerplate repository
+ARG WEB3_REPO="https://github.com/Nemil21/web3-boilerplate.git"
+ARG WEB3_REF="main"     # or pin a commit SHA
+RUN git clone --filter=blob:none --depth=1 -b "$WEB3_REF" "$WEB3_REPO" /srv/boilerplate-web3
+# Prewarm pnpm store for the Web3 boilerplate to speed installs at runtime
+RUN cd /srv/boilerplate-web3 && pnpm fetch
 
 # ---- (B) Install orchestrator deps (this was missing) ----
 # Copy only manifest first for layer caching

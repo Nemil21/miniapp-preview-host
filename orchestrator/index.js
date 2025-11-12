@@ -21,12 +21,23 @@ const IS_RAILWAY = process.env.RAILWAY_ENVIRONMENT === "true" || process.env.FOR
 const IS_LOCAL = !IS_RAILWAY;
 
 // Paths (env-overridable, Railway-optimized)
-// Default paths based on environment
-const DEFAULT_BOILERPLATE = IS_LOCAL 
-  ? path.join(process.cwd(), "..", "boilerplate")  // Local: relative to orchestrator dir
-  : "/srv/boilerplate";  // Production: Docker build path
+// Default paths based on environment for Farcaster boilerplate
+const DEFAULT_FARCASTER_BOILERPLATE = IS_LOCAL 
+  ? path.join(process.cwd(), "..", "boilerplate")  // Local: relative to orchestrator dir (fallback to old name)
+  : "/srv/boilerplate-farcaster";  // Production: Docker build path
 
-const BOILERPLATE = process.env.BOILERPLATE_DIR || DEFAULT_BOILERPLATE;
+// Default paths based on environment for Web3 boilerplate
+const DEFAULT_WEB3_BOILERPLATE = IS_LOCAL 
+  ? path.join(process.cwd(), "..", "..", "web3-boilerplate")  // Local: relative to orchestrator dir
+  : "/srv/boilerplate-web3";  // Production: Docker build path
+
+const FARCASTER_BOILERPLATE = process.env.FARCASTER_BOILERPLATE_DIR || DEFAULT_FARCASTER_BOILERPLATE;
+const WEB3_BOILERPLATE = process.env.WEB3_BOILERPLATE_DIR || DEFAULT_WEB3_BOILERPLATE;
+
+// Helper function to get the appropriate boilerplate based on app type
+function getBoilerplatePath(isWeb3 = false) {
+  return isWeb3 ? WEB3_BOILERPLATE : FARCASTER_BOILERPLATE;
+}
 const PREVIEWS_ROOT = IS_RAILWAY 
   ? (process.env.PREVIEWS_ROOT || "/tmp/previews")  // Use /tmp for Railway
   : (process.env.PREVIEWS_ROOT || "/srv/previews"); // Use /srv for local
@@ -742,9 +753,11 @@ function killProjectProcesses(projectId) {
   return Promise.resolve();
 }
 
-async function copyBoilerplate(dst) {
+async function copyBoilerplate(dst, boilerplateSrc = null) {
   const startTime = Date.now();
-  console.log(`[copyBoilerplate] Starting boilerplate copy to ${dst}...`);
+  // Use provided source or default to Farcaster boilerplate for backward compatibility
+  const BOILERPLATE = boilerplateSrc || FARCASTER_BOILERPLATE;
+  console.log(`[copyBoilerplate] Starting boilerplate copy from ${BOILERPLATE} to ${dst}...`);
   
   try {
     await fs.mkdir(dst, { recursive: true });
@@ -898,6 +911,7 @@ app.post("/validate", requireAuth, async (req, res) => {
   const validationStartTime = Date.now();
   const projectId = req.body.projectId || req.body.hash;
   const files = req.body.files;
+  const isWeb3 = req.body.isWeb3 || false; // Get app type from request
   
   // Railway-specific: Force disable heavy validation to avoid memory issues
   // Override client config on Railway - validation is already done on frontend
@@ -919,6 +933,7 @@ app.post("/validate", requireAuth, async (req, res) => {
   if (!files) return res.status(400).json({ error: "files required" });
 
   console.log(`[${projectId}] Starting compilation validation... (Environment: ${IS_RAILWAY ? 'Railway' : 'Local'})`);
+  console.log(`[${projectId}] App Type: ${isWeb3 ? 'Web3' : 'Farcaster'}`);
   console.log(`[${projectId}] Validation config:`, validationConfig);
   
   try {
@@ -930,8 +945,10 @@ app.post("/validate", requireAuth, async (req, res) => {
 
     console.log(`[${projectId}] Processing ${filesArray.length} files for validation`);
 
-    // Run full compilation validation using Railway validator
-    const validator = new RailwayCompilationValidator(process.cwd(), BOILERPLATE, PREVIEWS_ROOT, npmInstall);
+    // Run full compilation validation using Railway validator - use correct boilerplate
+    const boilerplatePath = getBoilerplatePath(isWeb3);
+    console.log(`[${projectId}] Using boilerplate for validation: ${boilerplatePath}`);
+    const validator = new RailwayCompilationValidator(process.cwd(), boilerplatePath, PREVIEWS_ROOT, npmInstall);
     const validationResult = await validator.validateProject(projectId, filesArray, validationConfig, run);
     
     console.log(`[${projectId}] Validation completed in ${Date.now() - validationStartTime}ms`);
@@ -1012,9 +1029,9 @@ app.post("/deploy-contracts", requireAuth, async (req, res) => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
 
-    // Copy boilerplate
+    // Copy boilerplate (use Web3 boilerplate as it has contract support)
     console.log(`[${projectId}] Setting up contract deployment environment...`);
-    await copyBoilerplate(tempDir);
+    await copyBoilerplate(tempDir, WEB3_BOILERPLATE);
 
     // Filter and write only contract-related files
     const contractFiles = files.filter(f =>
@@ -1128,7 +1145,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
         ((effectiveDeployToExternal === "vercel" && ENABLE_VERCEL_DEPLOYMENT) ||
          (effectiveDeployToExternal === "netlify" && ENABLE_NETLIFY_DEPLOYMENT))) {
       console.log(`[${projectId}] External deployment requested to ${effectiveDeployToExternal}`);
-      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime, jobId);
+      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime, jobId, isWeb3);
     }
 
     // Railway-specific: Return error if external deployment not available
@@ -1140,7 +1157,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
     }
 
     // Default: Local deployment flow (only for local environment)
-    return await handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime);
+    return await handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, isWeb3);
     
   } catch (e) {
     console.error(`[${projectId}] Deploy failed after ${Date.now() - deployStartTime}ms:`, e);
@@ -1149,10 +1166,11 @@ app.post("/deploy", requireAuth, async (req, res) => {
 });
 
 // Handle external deployment logic
-async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime, jobId) {
+async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime, jobId, isWeb3 = false) {
   try {
     console.log(`[${projectId}] Starting external deployment to ${platform}...`);
     console.log(`[${projectId}] JobId: ${jobId || 'not provided'}`);
+    console.log(`[${projectId}] App Type: ${isWeb3 ? 'Web3' : 'Farcaster'}`);
     
     // Initialize deployment job in tracking map
     deploymentJobs.set(projectId, {
@@ -1191,8 +1209,10 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
       }
     }
 
-    // Copy boilerplate and write files
-    await copyBoilerplate(dir);
+    // Copy boilerplate and write files - use correct boilerplate based on app type
+    const boilerplatePath = getBoilerplatePath(isWeb3);
+    console.log(`[${projectId}] Using boilerplate: ${boilerplatePath}`);
+    await copyBoilerplate(dir, boilerplatePath);
     await writeFiles(dir, filesArray);
 
     // Remove pnpm-lock.yaml to force npm usage
@@ -1336,7 +1356,7 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
     // For deployments that completed within threshold, check if platform was enabled
     if (!platformEnabled) {
       console.log(`[${projectId}] ${platform} deployment disabled or not configured, falling back to local`);
-      return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime);
+      return handleLocalDeployment(projectId, filesArray, true, skipContracts, res, deployStartTime, isWeb3);
     }
 
     // Register external deployment in previews map for updates
@@ -1386,8 +1406,11 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
 }
 
 // Handle local deployment logic
-async function handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime) {
+async function handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, isWeb3 = false) {
   try {
+    console.log(`[${projectId}] Starting local deployment...`);
+    console.log(`[${projectId}] App Type: ${isWeb3 ? 'Web3' : 'Farcaster'}`);
+    
     // If running, patch files and return
     if (previews.has(projectId)) {
       const running = previews.get(projectId);
@@ -1433,9 +1456,11 @@ async function handleLocalDeployment(projectId, filesArray, wait, skipContracts,
       }
     }
 
-    // Fresh: copy boilerplate, write deltas
+    // Fresh: copy boilerplate, write deltas - use correct boilerplate based on app type
     console.log(`[${projectId}] Setting up fresh local preview...`);
-    await copyBoilerplate(dir);
+    const boilerplatePath = getBoilerplatePath(isWeb3);
+    console.log(`[${projectId}] Using boilerplate: ${boilerplatePath}`);
+    await copyBoilerplate(dir, boilerplatePath);
     await writeFiles(dir, filesArray);
 
     // Install (always on fresh create)
@@ -1518,6 +1543,7 @@ app.post("/previews", requireAuth, async (req, res) => {
   const files = req.body.files;
   const validationResult = req.body.validationResult; // NEW: Optional validation result
   const wait = req.body.wait ?? true; // default: wait for readiness
+  const isWeb3 = req.body.isWeb3 || false; // Get app type from request
   if (!id) return res.status(400).json({ error: "id required" });
 
   // NEW: Check validation result before allowing deployment
@@ -1630,8 +1656,10 @@ app.post("/previews", requireAuth, async (req, res) => {
       }
     }
 
-    // Fresh: copy boilerplate, write deltas
-    await copyBoilerplate(dir);
+    // Fresh: copy boilerplate, write deltas - use correct boilerplate based on app type
+    const boilerplatePath = getBoilerplatePath(isWeb3);
+    console.log(`[${id}] Using boilerplate: ${boilerplatePath}`);
+    await copyBoilerplate(dir, boilerplatePath);
     await writeFiles(dir, files);
 
     // Install (always on fresh create)
@@ -1989,23 +2017,39 @@ const appStart = async () => {
   console.log(`Vercel enabled: ${ENABLE_VERCEL_DEPLOYMENT}`);
   console.log(`Netlify enabled: ${ENABLE_NETLIFY_DEPLOYMENT}`);
   console.log(`Contract deployment enabled: ${ENABLE_CONTRACT_DEPLOYMENT}`);
-  console.log(`Boilerplate path: ${BOILERPLATE}`);
+  console.log(`Farcaster boilerplate path: ${FARCASTER_BOILERPLATE}`);
+  console.log(`Web3 boilerplate path: ${WEB3_BOILERPLATE}`);
   console.log(`Previews root: ${PREVIEWS_ROOT}`);
   
-  // Verify boilerplate exists
-  if (!(await exists(BOILERPLATE))) {
-    console.error(`❌ BOILERPLATE DIRECTORY NOT FOUND: ${BOILERPLATE}`);
+  // Verify Farcaster boilerplate exists
+  if (!(await exists(FARCASTER_BOILERPLATE))) {
+    console.error(`❌ FARCASTER BOILERPLATE DIRECTORY NOT FOUND: ${FARCASTER_BOILERPLATE}`);
     console.error(`   Please check:`);
     if (IS_LOCAL) {
-      console.error(`   - Ensure the boilerplate directory exists at: ${path.resolve(BOILERPLATE)}`);
+      console.error(`   - Ensure the Farcaster boilerplate directory exists at: ${path.resolve(FARCASTER_BOILERPLATE)}`);
     } else {
-      console.error(`   - Docker build included the boilerplate`);
-      console.error(`   - BOILERPLATE_DIR environment variable is set correctly (should be /srv/boilerplate)`);
-      console.error(`   - Current BOILERPLATE_DIR: ${process.env.BOILERPLATE_DIR || 'not set'}`);
+      console.error(`   - Docker build included the Farcaster boilerplate`);
+      console.error(`   - FARCASTER_BOILERPLATE_DIR environment variable is set correctly (should be /srv/boilerplate-farcaster)`);
+      console.error(`   - Current FARCASTER_BOILERPLATE_DIR: ${process.env.FARCASTER_BOILERPLATE_DIR || 'not set'}`);
     }
-    throw new Error(`Boilerplate directory not found: ${BOILERPLATE}`);
+    throw new Error(`Farcaster boilerplate directory not found: ${FARCASTER_BOILERPLATE}`);
   }
-  console.log(`✅ Boilerplate directory verified`);
+  console.log(`✅ Farcaster boilerplate directory verified`);
+  
+  // Verify Web3 boilerplate exists
+  if (!(await exists(WEB3_BOILERPLATE))) {
+    console.error(`❌ WEB3 BOILERPLATE DIRECTORY NOT FOUND: ${WEB3_BOILERPLATE}`);
+    console.error(`   Please check:`);
+    if (IS_LOCAL) {
+      console.error(`   - Ensure the Web3 boilerplate directory exists at: ${path.resolve(WEB3_BOILERPLATE)}`);
+    } else {
+      console.error(`   - Docker build included the Web3 boilerplate`);
+      console.error(`   - WEB3_BOILERPLATE_DIR environment variable is set correctly (should be /srv/boilerplate-web3)`);
+      console.error(`   - Current WEB3_BOILERPLATE_DIR: ${process.env.WEB3_BOILERPLATE_DIR || 'not set'}`);
+    }
+    throw new Error(`Web3 boilerplate directory not found: ${WEB3_BOILERPLATE}`);
+  }
+  console.log(`✅ Web3 boilerplate directory verified`);
   
   server.listen(PORT, '0.0.0.0', () => console.log(`Listening on ${PORT}`));
 };

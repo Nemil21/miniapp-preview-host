@@ -15,13 +15,21 @@ ENV PREVIEWS_ROOT=/tmp/previews
 
 WORKDIR /srv
 
-# Clone boilerplate repository
-ARG BOILERPLATE_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
-ARG BOILERPLATE_REF="main"
-RUN git clone --filter=blob:none --depth=1 -b "$BOILERPLATE_REF" "$BOILERPLATE_REPO" /srv/boilerplate
+# Clone Farcaster boilerplate repository
+ARG FARCASTER_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
+ARG FARCASTER_REF="main"
+RUN git clone --filter=blob:none --depth=1 -b "$FARCASTER_REF" "$FARCASTER_REPO" /srv/boilerplate-farcaster
 
-# Prewarm npm cache for the boilerplate
-RUN cd /srv/boilerplate && npm install --prefer-offline
+# Clone Web3 boilerplate repository
+ARG WEB3_REPO="https://github.com/Nemil21/web3-boilerplate.git"
+ARG WEB3_REF="main"
+RUN git clone --filter=blob:none --depth=1 -b "$WEB3_REF" "$WEB3_REPO" /srv/boilerplate-web3
+
+# Prewarm npm cache for the Farcaster boilerplate
+RUN cd /srv/boilerplate-farcaster && npm install --prefer-offline
+
+# Prewarm npm cache for the Web3 boilerplate
+RUN cd /srv/boilerplate-web3 && npm install --prefer-offline
 
 # Install orchestrator dependencies
 COPY orchestrator/package.json /srv/orchestrator/package.json
