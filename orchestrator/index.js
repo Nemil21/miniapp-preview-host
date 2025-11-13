@@ -590,17 +590,23 @@ async function deployContractsFromPath(contractsDir, projectId, logs) {
     }
     console.log(`[${projectId}] ✅ Deploy script found`);
 
-    // Deploy to Base Sepolia
-    console.log(`[${projectId}] Deploying to Base Sepolia testnet...`);
+    // Deploy to Base (use BASE_NETWORK env var to switch between 'base' mainnet or 'baseSepolia' testnet)
+    const BASE_NETWORK = process.env.BASE_NETWORK || "base"; // Default to Base Mainnet
+    const BASE_RPC_URL = BASE_NETWORK === "base" 
+      ? process.env.BASE_RPC_URL || "https://mainnet.base.org"
+      : BASE_SEPOLIA_RPC_URL;
+    
+    console.log(`[${projectId}] Deploying to ${BASE_NETWORK === 'base' ? 'Base Mainnet' : 'Base Sepolia testnet'}...`);
     const env = {
       ...process.env,
       PRIVATE_KEY,
+      BASE_RPC_URL,
       BASE_SEPOLIA_RPC_URL,
-      HARDHAT_NETWORK: "baseSepolia"
+      HARDHAT_NETWORK: BASE_NETWORK
     };
 
     try {
-      await run("npx", ["hardhat", "run", "scripts/deploy.js", "--network", "baseSepolia"], {
+      await run("npx", ["hardhat", "run", "scripts/deploy.js", "--network", BASE_NETWORK], {
         id: projectId,
         cwd: contractsDir,
         env,
