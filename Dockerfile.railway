@@ -17,12 +17,12 @@ WORKDIR /srv
 
 # Clone Farcaster boilerplate repository
 ARG FARCASTER_REPO="https://github.com/Nemil21/minidev-boilerplate.git"
-ARG FARCASTER_REF="main"
+ARG FARCASTER_REF="master"
 RUN git clone --filter=blob:none --depth=1 -b "$FARCASTER_REF" "$FARCASTER_REPO" /srv/boilerplate-farcaster
 
 # Clone Web3 boilerplate repository
 ARG WEB3_REPO="https://github.com/Nemil21/web3-boilerplate.git"
-ARG WEB3_REF="main"
+ARG WEB3_REF="master"
 RUN git clone --filter=blob:none --depth=1 -b "$WEB3_REF" "$WEB3_REPO" /srv/boilerplate-web3
 
 # Prewarm npm cache for the Farcaster boilerplate
