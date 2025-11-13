@@ -23,7 +23,7 @@ const IS_LOCAL = !IS_RAILWAY;
 // Paths (env-overridable, Railway-optimized)
 // Default paths based on environment for Farcaster boilerplate
 const DEFAULT_FARCASTER_BOILERPLATE = IS_LOCAL 
-  ? path.join(process.cwd(), "..", "boilerplate")  // Local: relative to orchestrator dir (fallback to old name)
+  ? path.join(process.cwd(), "..", "..", "minidev-boilerplate")  // Local: relative to orchestrator dir
   : "/srv/boilerplate-farcaster";  // Production: Docker build path
 
 // Default paths based on environment for Web3 boilerplate
@@ -35,8 +35,8 @@ const FARCASTER_BOILERPLATE = process.env.FARCASTER_BOILERPLATE_DIR || DEFAULT_F
 const WEB3_BOILERPLATE = process.env.WEB3_BOILERPLATE_DIR || DEFAULT_WEB3_BOILERPLATE;
 
 // Helper function to get the appropriate boilerplate based on app type
-function getBoilerplatePath(isWeb3 = false) {
-  return isWeb3 ? WEB3_BOILERPLATE : FARCASTER_BOILERPLATE;
+function getBoilerplatePath(appType = 'farcaster') {
+  return appType === 'web3' ? WEB3_BOILERPLATE : FARCASTER_BOILERPLATE;
 }
 const PREVIEWS_ROOT = IS_RAILWAY 
   ? (process.env.PREVIEWS_ROOT || "/tmp/previews")  // Use /tmp for Railway
@@ -1214,7 +1214,8 @@ app.post("/deploy", requireAuth, async (req, res) => {
   const files = req.body.files;
   const wait = req.body.wait ?? true; // default: wait for readiness
   const deployToExternal = req.body.deployToExternal; // platform: "vercel" | "netlify" | undefined
-  const isWeb3 = req.body.isWeb3;
+  const appType = req.body.appType || 'farcaster'; // 'farcaster' | 'web3' - which boilerplate to use
+  const isWeb3 = req.body.isWeb3; // whether to deploy contracts (deprecated, use appType for boilerplate selection)
   const skipContracts = req.body.skipContracts ?? false; // default: false (deploy contracts if they exist)
   const jobId = req.body.jobId; // Job ID for background deployment error reporting
 
@@ -1222,7 +1223,14 @@ app.post("/deploy", requireAuth, async (req, res) => {
   if (!files) return res.status(400).json({ error: "files required" });
 
   console.log(`[${projectId}] Starting deploy process... (Environment: ${IS_RAILWAY ? 'Railway' : 'Local'})`);
-  console.log(`[${projectId}] Deploy flags: isWeb3=${isWeb3}, skipContracts=${skipContracts}`);
+  console.log(`[${projectId}] ${'='.repeat(60)}`);
+  console.log(`[${projectId}] 🎯 ORCHESTRATOR RECEIVED PARAMETERS:`);
+  console.log(`[${projectId}] ${'='.repeat(60)}`);
+  console.log(`[${projectId}] 📦 appType: "${appType}" (${typeof appType})`);
+  console.log(`[${projectId}] 🔗 isWeb3: ${isWeb3} (${typeof isWeb3})`);
+  console.log(`[${projectId}] ⏭️  skipContracts: ${skipContracts}`);
+  console.log(`[${projectId}] 🌐 deployToExternal: ${deployToExternal}`);
+  console.log(`[${projectId}] ${'='.repeat(60)}`);
   
   try {
     // Convert files object to array format
@@ -1244,7 +1252,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
         ((effectiveDeployToExternal === "vercel" && ENABLE_VERCEL_DEPLOYMENT) ||
          (effectiveDeployToExternal === "netlify" && ENABLE_NETLIFY_DEPLOYMENT))) {
       console.log(`[${projectId}] External deployment requested to ${effectiveDeployToExternal}`);
-      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime, jobId, isWeb3);
+      return await handleExternalDeployment(projectId, filesArray, effectiveDeployToExternal, skipContracts, res, deployStartTime, jobId, appType);
     }
 
     // Railway-specific: Return error if external deployment not available
@@ -1256,7 +1264,7 @@ app.post("/deploy", requireAuth, async (req, res) => {
     }
 
     // Default: Local deployment flow (only for local environment)
-    return await handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, isWeb3);
+    return await handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, appType);
     
   } catch (e) {
     console.error(`[${projectId}] Deploy failed after ${Date.now() - deployStartTime}ms:`, e);
@@ -1265,11 +1273,11 @@ app.post("/deploy", requireAuth, async (req, res) => {
 });
 
 // Handle external deployment logic
-async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime, jobId, isWeb3 = false) {
+async function handleExternalDeployment(projectId, filesArray, platform, skipContracts, res, deployStartTime, jobId, appType = 'farcaster') {
   try {
     console.log(`[${projectId}] Starting external deployment to ${platform}...`);
     console.log(`[${projectId}] JobId: ${jobId || 'not provided'}`);
-    console.log(`[${projectId}] App Type: ${isWeb3 ? 'Web3' : 'Farcaster'}`);
+    console.log(`[${projectId}] App Type: ${appType}`);
     
     // Initialize deployment job in tracking map
     deploymentJobs.set(projectId, {
@@ -1309,8 +1317,12 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
     }
 
     // Copy boilerplate and write files - use correct boilerplate based on app type
-    const boilerplatePath = getBoilerplatePath(isWeb3);
-    console.log(`[${projectId}] Using boilerplate: ${boilerplatePath}`);
+    const boilerplatePath = getBoilerplatePath(appType);
+    console.log(`[${projectId}] ${'='.repeat(60)}`);
+    console.log(`[${projectId}] 📦 BOILERPLATE SELECTION:`);
+    console.log(`[${projectId}] - appType: "${appType}"`);
+    console.log(`[${projectId}] - Selected path: ${boilerplatePath}`);
+    console.log(`[${projectId}] ${'='.repeat(60)}`);
     await copyBoilerplate(dir, boilerplatePath);
     await writeFiles(dir, filesArray);
 
@@ -1505,10 +1517,10 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
 }
 
 // Handle local deployment logic
-async function handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, isWeb3 = false) {
+async function handleLocalDeployment(projectId, filesArray, wait, skipContracts, res, deployStartTime, appType = 'farcaster') {
   try {
     console.log(`[${projectId}] Starting local deployment...`);
-    console.log(`[${projectId}] App Type: ${isWeb3 ? 'Web3' : 'Farcaster'}`);
+    console.log(`[${projectId}] App Type: ${appType}`);
     
     // If running, patch files and return
     if (previews.has(projectId)) {
@@ -1557,8 +1569,12 @@ async function handleLocalDeployment(projectId, filesArray, wait, skipContracts,
 
     // Fresh: copy boilerplate, write deltas - use correct boilerplate based on app type
     console.log(`[${projectId}] Setting up fresh local preview...`);
-    const boilerplatePath = getBoilerplatePath(isWeb3);
-    console.log(`[${projectId}] Using boilerplate: ${boilerplatePath}`);
+    const boilerplatePath = getBoilerplatePath(appType);
+    console.log(`[${projectId}] ${'='.repeat(60)}`);
+    console.log(`[${projectId}] 📦 BOILERPLATE SELECTION (Local):`);
+    console.log(`[${projectId}] - appType: "${appType}"`);
+    console.log(`[${projectId}] - Selected path: ${boilerplatePath}`);
+    console.log(`[${projectId}] ${'='.repeat(60)}`);
     await copyBoilerplate(dir, boilerplatePath);
     await writeFiles(dir, filesArray);
 
