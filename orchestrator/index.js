@@ -11,6 +11,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import httpProxy from "http-proxy"; // CJS default import
 import { RailwayCompilationValidator } from "./validation.js";
+import Anthropic from "@anthropic-ai/sdk";
 
 
 /* ========= Config ========= */
@@ -73,6 +74,17 @@ const FORCE_EXTERNAL_DEPLOYMENT = process.env.FORCE_EXTERNAL_DEPLOYMENT === "tru
 // Miniapp creator URL for callbacks (job status updates)
 const MINIAPP_CREATOR_URL = process.env.MINIAPP_CREATOR_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
+// AI Error Extraction
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+
+// Log Claude availability on startup
+if (anthropic) {
+  console.log(`✅ Claude 3.5 Haiku enabled for error extraction (API key: ${ANTHROPIC_API_KEY.substring(0, 10)}...)`);
+} else {
+  console.log(`⚠️  Claude error extraction disabled - ANTHROPIC_API_KEY not set`);
+}
+
 /* ========= Small utils ========= */
 
 async function exists(p) {
@@ -98,28 +110,133 @@ function makeRing(cap = 4000) {
   };
 }
 
-  /**
- * Extract meaningful error from deployment logs
+/**
+ * Extract error using Claude 3.5 Haiku for intelligent parsing
+ * This provides much better error extraction than regex patterns
+ */
+async function extractErrorWithClaude(logs, projectId) {
+  if (!anthropic || !logs) {
+    return null;
+  }
+
+  try {
+    console.log(`[${projectId}] 🤖 Using Claude 3.5 Haiku to extract error from logs...`);
+    
+    // Limit logs to last 8000 characters to stay within token limits
+    const truncatedLogs = logs.slice(-8000);
+    
+    const message = await anthropic.messages.create({
+      model: "claude-3-5-haiku-20241022",
+      max_tokens: 800,
+      temperature: 0,
+      messages: [{
+        role: "user",
+        content: `You are analyzing deployment logs to extract ALL build errors. Your task is to find and return all real error messages that caused the deployment to fail.
+
+Deployment logs:
+\`\`\`
+${truncatedLogs}
+\`\`\`
+
+Extract and return ALL errors that caused the build to fail. For each error, include:
+1. The file path and line number if available
+2. The error type (TypeScript, Module, ESLint, etc.)
+3. The specific error message
+4. Relevant code context if shown
+
+Do NOT include:
+- Generic "Command exited" or "npx exited" messages
+- Vercel/deployment platform output
+- Success messages or warnings
+- Timestamps or log prefixes
+
+If there are multiple errors, list them all clearly separated. Format your response as clear, concise error messages that a developer can immediately understand and fix. Start with the root/first error, then list any subsequent errors.`
+      }]
+    });
+
+    const extractedError = message.content[0].text.trim();
+    
+    if (extractedError && extractedError.length > 10) {
+      console.log(`[${projectId}] ✅ Claude extracted error (${extractedError.length} chars):`, extractedError.substring(0, 200));
+      return extractedError;
+    }
+    
+    console.log(`[${projectId}] ⚠️ Claude returned empty or too short response`);
+    return null;
+  } catch (error) {
+    console.error(`[${projectId}] ❌ Claude error extraction failed:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Extract meaningful error from deployment logs using regex patterns
+ * This is a fallback when Claude is not available or fails
+ * Extracts ONLY the actual error, not the entire Vercel output
  */
 function extractErrorFromLogs(logs) {
   if (!logs) return null;
   
-  // Try to find TypeScript errors
-  const tsErrorMatch = logs.match(/Type error:([^\n]+(?:\n(?![\s]*$)[^\n]+)*)/);
-  if (tsErrorMatch) {
-    return `TypeScript Error: ${tsErrorMatch[1].trim()}`;
+  const errors = [];
+  
+  // Strategy: Find ALL actual build errors, not just the first one
+  
+  // 1. TypeScript errors with file location and code context
+  const tsErrorWithLocationPattern = /(\.\/[^\s]+:\d+:\d+)\s*\n\s*Type error: ([^\n]+)\s*\n((?:\s*\d+\s*\|[^\n]*\n)*(?:\s*>\s*\d+\s*\|[^\n]*\n)?(?:\s*\|[^\n]*\n)?(?:\s*\d+\s*\|[^\n]*\n)*)/g;
+  let tsLocationMatch;
+  while ((tsLocationMatch = tsErrorWithLocationPattern.exec(logs)) !== null) {
+    const location = tsLocationMatch[1];
+    const errorMsg = tsLocationMatch[2].trim();
+    const codeContext = tsLocationMatch[3].trim();
+    errors.push(`TypeScript Error at ${location}:\n${errorMsg}\n\n${codeContext}`);
   }
   
-  // Try to find ESLint errors
-  const eslintErrorMatch = logs.match(/Error:([^\n]+(?:\n(?![\s]*$)[^\n]+)*)/);
-  if (eslintErrorMatch) {
-    return `Build Error: ${eslintErrorMatch[1].trim()}`;
+  // 2. TypeScript errors with just file location (no code context) - only if not already captured
+  if (errors.length === 0) {
+    const tsErrorSimplePattern = /(\.\/[^\s]+:\d+:\d+)\s*\n\s*Type error: ([^\n]+)/g;
+    let tsSimpleMatch;
+    while ((tsSimpleMatch = tsErrorSimplePattern.exec(logs)) !== null) {
+      const location = tsSimpleMatch[1];
+      const errorMsg = tsSimpleMatch[2].trim();
+      errors.push(`TypeScript Error at ${location}:\n${errorMsg}`);
+    }
   }
   
-  // Try to find "Failed to compile" errors
-  const compileErrorMatch = logs.match(/Failed to compile\.([\s\S]{0,500})/);
-  if (compileErrorMatch) {
-    return `Compilation Failed: ${compileErrorMatch[1].trim()}`;
+  // 3. Module not found errors
+  const modulePattern = /Module not found: ([^\n]+)/g;
+  let moduleMatch;
+  while ((moduleMatch = modulePattern.exec(logs)) !== null) {
+    errors.push(`Module Error: ${moduleMatch[1].trim()}`);
+  }
+  
+  // 4. ESLint errors
+  const eslintPattern = /ESLint: ([^\n]+)/g;
+  let eslintMatch;
+  while ((eslintMatch = eslintPattern.exec(logs)) !== null) {
+    errors.push(`ESLint Error: ${eslintMatch[1].trim()}`);
+  }
+  
+  // If we found multiple errors, return them all
+  if (errors.length > 0) {
+    if (errors.length === 1) {
+      return errors[0];
+    }
+    return `Multiple Errors Found:\n\n${errors.map((err, idx) => `${idx + 1}. ${err}`).join('\n\n')}`;
+  }
+  
+  // 5. Failed to compile with context (fallback for unstructured errors)
+  const compilePattern = /Failed to compile\.([\s\S]{0,1000})(?=Next\.js build|Error: Command|$)/;
+  const compileMatch = logs.match(compilePattern);
+  if (compileMatch) {
+    const errorText = compileMatch[1].trim();
+    return `Build Failed:\n${errorText}`;
+  }
+  
+  // 6. Generic error lines (but not "Command exited" or "npx exited")
+  const errorPattern = /\n(Error: (?!Command|npx)[^\n]+)/;
+  const errorMatch = logs.match(errorPattern);
+  if (errorMatch) {
+    return errorMatch[1].trim();
   }
   
   return null;
@@ -135,13 +252,43 @@ async function notifyJobFailure(jobId, projectId, error, logs) {
   }
 
   try {
-    console.log(`[${projectId}] 📞 Notifying miniapp-creator of job failure for jobId: ${jobId}`);
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`[${projectId}] 📞 Notifying miniapp-creator of job failure`);
+    console.log(`${'='.repeat(80)}`);
+    console.log(`[${projectId}] 🔑 JobId: ${jobId}`);
+    console.log(`[${projectId}] 🌐 Target URL: ${MINIAPP_CREATOR_URL}/api/jobs/${jobId}/fail`);
+    console.log(`[${projectId}] 🔐 Using auth token: ${AUTH_TOKEN ? 'Yes (length: ' + AUTH_TOKEN.length + ')' : 'No'}`);
     
-    // Extract detailed error from logs
-    const detailedError = extractErrorFromLogs(logs);
+    // Extract detailed error from logs using Claude first, then regex
+    let detailedError = null;
+    
+    // Try Claude extraction first
+    if (anthropic && logs) {
+      detailedError = await extractErrorWithClaude(logs, projectId);
+    }
+    
+    // Fall back to regex if Claude fails or is not available
+    if (!detailedError) {
+      console.log(`[${projectId}] 📋 Claude not available or failed, using regex extraction...`);
+      detailedError = extractErrorFromLogs(logs);
+    }
+    
     const deploymentError = detailedError || error || 'Background deployment failed';
     
-    console.log(`[${projectId}] 📋 Detailed error: ${deploymentError.substring(0, 200)}`);
+    console.log(`[${projectId}] 📋 Error details:`);
+    console.log(`[${projectId}]    - Raw error: ${error?.substring(0, 200) || 'none'}`);
+    console.log(`[${projectId}]    - Extracted error: ${detailedError?.substring(0, 200) || 'none'}`);
+    console.log(`[${projectId}]    - Final deploymentError: ${deploymentError.substring(0, 200)}`);
+    console.log(`[${projectId}]    - Logs length: ${logs?.length || 0} chars`);
+    
+    const payload = {
+      error: error || 'Background deployment failed',
+      logs: logs || '',
+      deploymentError: deploymentError
+    };
+    
+    console.log(`[${projectId}] 📦 Sending payload (first 500 chars):`);
+    console.log(JSON.stringify(payload, null, 2).substring(0, 500));
     
     const response = await fetch(`${MINIAPP_CREATOR_URL}/api/jobs/${jobId}/fail`, {
       method: 'POST',
@@ -149,21 +296,24 @@ async function notifyJobFailure(jobId, projectId, error, logs) {
         'Authorization': `Bearer ${AUTH_TOKEN}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        error: error || 'Background deployment failed',
-        logs: logs || '',
-        deploymentError: deploymentError
-      })
+      body: JSON.stringify(payload)
     });
 
+    console.log(`[${projectId}] 📡 Response status: ${response.status} ${response.statusText}`);
+
     if (response.ok) {
+      const result = await response.json();
       console.log(`[${projectId}] ✅ Job ${jobId} marked as failed in database`);
+      console.log(`[${projectId}] ✅ Response:`, JSON.stringify(result, null, 2));
     } else {
       const errorText = await response.text();
-      console.error(`[${projectId}] ❌ Failed to notify job failure: ${response.status} ${errorText}`);
+      console.error(`[${projectId}] ❌ Failed to notify job failure: ${response.status}`);
+      console.error(`[${projectId}] ❌ Error response: ${errorText}`);
     }
+    console.log(`${'='.repeat(80)}\n`);
   } catch (notifyError) {
     console.error(`[${projectId}] ❌ Error notifying job failure:`, notifyError.message);
+    console.error(`[${projectId}] ❌ Stack:`, notifyError.stack);
   }
 }
 
@@ -1001,21 +1151,14 @@ app.post("/validate", requireAuth, async (req, res) => {
   const files = req.body.files;
   const isWeb3 = req.body.isWeb3 || false; // Get app type from request
   
-  // Railway-specific: Force disable heavy validation to avoid memory issues
-  // Override client config on Railway - validation is already done on frontend
-  const validationConfig = IS_RAILWAY ? {
-    enableTypeScript: true,  // Force skip - memory intensive
-    enableSolidity: true,    // Force skip - memory intensive  
-    enableESLint: true,      // Force skip - memory intensive
-    enableBuild: true,       // Force skip - memory intensive
-    enableRuntimeChecks: true // Keep - lightweight
-  } : (req.body.validationConfig || {
+  // Railway Pro: Enable full validation with ESLint disabled (ignored in next.config.ts builds)
+  const validationConfig = req.body.validationConfig || {
     enableTypeScript: true,
     enableSolidity: true,
-    enableESLint: true,
+    enableESLint: false,     // Disabled - ESLint is ignored in production builds (next.config.ts)
     enableBuild: true,
     enableRuntimeChecks: true
-  });
+  };
   
   if (!projectId) return res.status(400).json({ error: "projectId required" });
   if (!files) return res.status(400).json({ error: "files required" });
@@ -1507,17 +1650,61 @@ async function handleExternalDeployment(projectId, filesArray, platform, skipCon
 
   } catch (e) {
     console.error(`[${projectId}] External deployment failed:`, e);
+    console.error(`[${projectId}] Error message:`, e.message);
+    console.error(`[${projectId}] Error stdout:`, e.stdout);
+    console.error(`[${projectId}] Error stderr:`, e.stderr);
+    console.error(`[${projectId}] Error output:`, e.output);
     
     // Capture deployment logs for error analysis (logs may not be defined if error happens early)
     const deploymentLogs = typeof logs !== 'undefined' && logs.text ? logs.text() : '';
-    const errorOutput = e.output || e.stdout || e.stderr || '';
     
+    // Extract the REAL error from stdout/stderr, not just "npx exited null"
+    const errorOutput = e.output || e.stdout || e.stderr || '';
+    const realError = e.stderr || e.stdout || errorOutput || e.message;
+    
+    // Try to extract specific error using Claude first, then fall back to regex
+    let detailedError = null;
+    
+    // 1. Try Claude extraction (best results)
+    if (anthropic) {
+      detailedError = await extractErrorWithClaude(errorOutput || deploymentLogs, projectId);
+    }
+    
+    // 2. Fall back to regex extraction if Claude fails or is not available
+    if (!detailedError) {
+      console.log(`[${projectId}] 📋 Claude not available or failed, using regex extraction...`);
+      detailedError = extractErrorFromLogs(errorOutput || deploymentLogs);
+      console.log(`[${projectId}] 🔍 Regex extracted error:`, detailedError?.substring(0, 300) || 'none');
+    }
+    
+    // Use extracted error if available, otherwise try stderr/stdout
+    let finalError;
+    if (detailedError) {
+      // We found a specific TypeScript/build error - use it!
+      finalError = detailedError;
+      console.log(`[${projectId}] ✅ Using extracted detailed error`);
+    } else if (e.message && (e.message.includes('npx exited') || e.message === 'null')) {
+      // Generic npx error - use stderr/stdout
+      finalError = realError || e.message;
+      console.log(`[${projectId}] ⚠️ Using stderr/stdout as fallback`);
+    } else {
+      // Use the error message as-is
+      finalError = e.message;
+      console.log(`[${projectId}] ℹ️ Using error message as-is`);
+    }
+    
+    console.error(`[${projectId}] 📋 Final error to return (first 500 chars):`, finalError.substring(0, 500));
+    
+    // Return the extracted error directly without wrapping it in generic text
     return res.status(500).json({
       success: false,
-      error: `External deployment to ${platform} failed: ${e.message}`,
+      error: finalError,  // Just the actual error, not "External deployment to X failed: ..."
+      deploymentError: finalError,  // Also set this field for consistency
       details: e.stack,
       logs: deploymentLogs,
-      output: errorOutput
+      output: errorOutput,
+      stderr: e.stderr || '',
+      stdout: e.stdout || ''
     });
   }
 }
